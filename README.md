@@ -25,10 +25,18 @@ air-gap capable (d3 vendored, OUI database bundled, zero external calls).
 
 ## Install
 
+Run from a checkout (air-gap friendly — no CDN/network deps at runtime):
+
 ```
-uv venv && source .venv/bin/activate   # or any Python 3.11+
+uv venv && source .venv/bin/activate   # or any Python 3.10+
 pip install scapy flask
 sudo apt install graphviz              # optional, for svg/png export
+```
+
+Or install as a package (adds the `downstream` console command):
+
+```
+pip install .
 ```
 
 ## Quick start (synthetic demo plant)
@@ -112,7 +120,7 @@ the previous round learned. It stops when no new targets appear.
 **Write-class probes do not exist in this tool.** The technique registry is a
 closed set of read-only discovery methods (`arp_ping`, `tcp_probe`, `modbus_id`,
 `enip_list`, `mdns_query`, `ssdp_msearch`,
-`modbus_unit_sweep`, `bacnet_whois`); unknown technique names are hard
+`modbus_unit_sweep`, `bacnet_whois`, `s7_szl`); unknown technique names are hard
 blocked at execution time.
 
 ## API (serve mode)
@@ -133,7 +141,7 @@ blocked at execution time.
 python3 -m pytest tests/ -q
 ```
 
-44 tests over the synthetic known-answer fixture: vendors, roles, edges,
+45 tests over the synthetic known-answer fixture: vendors, roles, edges,
 gateway/concentrator virtual children, router-guard, TTL hop inference, attack
 paths, smart-building/IoT devices (mDNS/SSDP/MQTT/KNX), IoT-on-OT findings,
 active gating (dry-run, unknown-technique block, confirm-requires-yes),

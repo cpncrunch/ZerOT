@@ -1,0 +1,41 @@
+[project]
+name = "downstream-ot"
+version = "0.4.0"
+description = "Passive-first OT/ICS asset discovery with BloodHound-style graphing and a gated read-only active layer"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Isaac Privett", email = "iprivett@packetlabs.ca" }]
+keywords = ["ics", "ot", "scada", "modbus", "dnp3", "bacnet", "s7", "security", "passive-discovery"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
+dependencies = [
+    "scapy>=2.5",
+    "flask>=3.0",
+]
+
+[project.scripts]
+downstream = "downstream:main"
+
+[project.urls]
+Homepage = "https://github.com/iprivett/downstream"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# single-file module: ship the module plus the static UI and data files it
+# loads relative to its own location (ROOT = Path(__file__).parent)
+only-include = ["downstream.py"]
+force-include = { "static" = "static", "data" = "data" }
+
+[tool.hatch.build.targets.sdist]
+only-include = ["downstream.py", "static", "data", "tests", "scripts", "README.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

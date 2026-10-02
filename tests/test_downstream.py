@@ -585,3 +585,82 @@ def test_iec104_command_direction_counts_write():
     m.ingest_packets([req, ack])
     e = m.edges[("00:0C:29:AA:07:20", "74:F6:61:AA:05:33", "iec104")]
     assert e.writes == 1
+
+
+def test_s7_szl_probe_against_fixture_plc():
+    """Mock S7 PLC speaking the s7-info handshake; probe must extract module,
+    hardware, firmware, and identity strings from nmap-proven offsets."""
+    import socket as sk
+    import threading
+
+    def s7_msg(payload):                       # TPKT(4) + payload
+        return struct.pack(">BBH", 3, 0, 4 + len(payload)) + payload
+
+    # --- build SZL responses; offsets are absolute over the FULL frame
+    # (nmap parses TPKT-inclusive), so place bytes at abs-4 inside the body
+    # that s7_msg() will append after the 4-byte TPKT header.
+    def frame(n, proto=0x32):
+        b = bytearray(n)
+        b[7 - 4] = proto                        # nmap checks frame[7]
+        return b
+
+    r11 = frame(224)
+    r11[31 - 4] = 0x11                          # szl id low byte
+    r11[44 - 4:44 - 4 + 12] = b"CPU 315-2 PN/DP"        # module
+    r11[72 - 4:72 - 4 + 18] = b"6ES7 315-2EH14-0AB0 "   # basic hardware
+    r11[123 - 4], r11[124 - 4], r11[125 - 4] = 3, 2, 1  # firmware
+
+    r1c = frame(240)
+    r1c[31 - 4] = 0x1C
+    r1c[40 - 4:40 - 4 + 16] = b"SIMATIC 300(1)\x00"     # system name
+    r1c[74 - 4:74 - 4 + 16] = b"CPU 315-2 PN/DP\x00"    # module type
+    r1c[108 - 4:108 - 4 + 12] = b"TankFarm A\x00"       # plant id
+    r1c[142 - 4:142 - 4 + 11] = b"Siemens AG\x00"       # copyright
+    r1c[176 - 4:176 - 4 + 17] = b"S C-B2A4 12345678\x00"  # serial
+
+    srv = sk.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    def serve():
+        conn, _ = srv.accept()
+        with conn:
+            def rd():
+                h = conn.recv(4)
+                if len(h) < 4:
+                    return None
+                want = struct.unpack(">H", h[2:4])[0] - 4
+                b = b""
+                while len(b) < want:
+                    c = conn.recv(want - len(b))
+                    if not c:
+                        return None
+                    b += c
+                return h + b
+            rd()                                # COTP CR -> CC
+            conn.sendall(s7_msg(bytes([0x11, 0xe0, 0x00, 0x00, 0x00, 0x05, 0x00, 0xc0])))
+            rd()                                # setup -> S7 ack-data (all-zero codes)
+            conn.sendall(s7_msg(bytes([0x02, 0xf0, 0x80, 0x32, 0x03]) + b"\x00" * 11))
+            rd()                                # SZL 11 req
+            conn.sendall(s7_msg(bytes(r11)))
+            rd()                                # SZL 1C req
+            conn.sendall(s7_msg(bytes(r1c)))
+        srv.close()
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    m = Model(Scope(SCOPE))
+    res = ds._probe_s7_szl("127.0.0.1", m, port=port, timeout=2.0)
+    t.join(timeout=3.0)
+    assert res is not None, "probe returned None — handshake or parse failed"
+    assert res["module"] == "CPU 315-2 PN/DP"
+    assert res["basic_hardware"] == "6ES7 315-2EH14-0AB0"
+    assert res["firmware"] == "3.2.1"
+    assert res["system_name"] == "SIMATIC 300(1)"
+    assert res["plant_id"] == "TankFarm A"
+    assert res["serial"] == "S C-B2A4 12345678"
+    a = m.resolve(ip="127.0.0.1")
+    assert a.attrs.get("s7_module") == "CPU 315-2 PN/DP"
+    assert "s7_slave" in a.roles
+    assert (a.id, a.id, "s7comm") not in m.edges    # no self-edge artifact

@@ -1423,7 +1423,7 @@ class Model:
 
 # Registry: ONLY read-only discovery techniques exist. Write-class probes are
 # deliberately not implemented; requesting an unknown technique is a hard block.
-ACTIVE_TECHNIQUES = {"arp_ping", "tcp_probe", "modbus_id", "enip_list", "mdns_query", "ssdp_msearch", "modbus_unit_sweep", "bacnet_whois"}
+ACTIVE_TECHNIQUES = {"arp_ping", "tcp_probe", "modbus_id", "enip_list", "mdns_query", "ssdp_msearch", "modbus_unit_sweep", "bacnet_whois", "s7_szl"}
 
 
 class ActivePlanner:
@@ -1642,6 +1642,81 @@ def _probe_ssdp(ip: str, model: Model):
     return {"ip": ip, "upnp_server": a.attrs.get("upnp_server", "?")}
 
 
+def _probe_s7_szl(ip: str, model: Model, port: int = 102, timeout: float = 2.5):
+    """Identify a Siemens S7 PLC via Read SZL (byte nmap s7-info):
+    COTP CR + S7 setup, then SZL 0x0011 (module/basic-hardware) and 0x001C
+    (serial/firmware). Read-only."""
+    cotp_cr = bytes.fromhex("0300001611e00000001400c1020100c2020102c0010a")
+    setup = bytes.fromhex("0300001902f08032010000000000080000f0000001000101e0")
+    szl_11 = bytes.fromhex("0300002102f080320700000000000800080001120411440100ff09000400110001")
+    szl_1c = bytes.fromhex("0300002102f080320700000000000800080001120411440100ff090004001c0001")
+
+    def recv_msg(s, first=False):
+        """Receive one TPKT message; on first read the COTP CC arrives alone."""
+        hdr = s.recv(4)
+        if len(hdr) < 4 or hdr[0] != 0x03:
+            return b""
+        want = struct.unpack(">H", hdr[2:4])[0] - 4
+        data = b""
+        while len(data) < want:
+            chunk = s.recv(want - len(data))
+            if not chunk:
+                break
+            data += chunk
+        return hdr + data
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    info = {}
+    try:
+        s.connect((ip, port))
+        s.send(cotp_cr)
+        recv_msg(s)                              # COTP CC
+        s.send(setup)
+        recv_msg(s)                              # setup ack
+        for req, szl_id in ((szl_11, 0x0011), (szl_1c, 0x001C)):
+            s.send(req)
+            resp = recv_msg(s)
+            if len(resp) < 40 or resp[7] != 0x32:
+                continue
+            if szl_id == 0x0011:
+                # nmap s7-info first-response offsets (absolute, whole frame)
+                if len(resp) >= 125 and resp[31] == 0x11:
+                    info["module"] = resp[44:].split(b"\x00")[0].decode("latin1", "replace").strip()
+                    info["basic_hardware"] = resp[72:].split(b"\x00")[0].decode("latin1", "replace").strip()
+                    info["firmware"] = f"{resp[123]}.{resp[124]}.{resp[125]}" if len(resp) > 125 else ""
+            else:
+                # nmap second-response offsets; real PLCs w/ szl-id!=0x1C at [31]
+                # need +4 (observed quirk kept from the NSE)
+                off = 0 if resp[31] == 0x1C else 4
+                def z_at(n):
+                    return resp[n + off:].split(b"\x00")[0].decode("latin1", "replace").strip() if len(resp) > n + off else ""
+                sysname = z_at(40)
+                mtype = z_at(74)
+                plant = z_at(108)
+                copy = z_at(142)
+                serial = z_at(176)
+                for k, v in (("system_name", sysname), ("module_type", mtype),
+                             ("plant_id", plant), ("copyright", copy), ("serial", serial)):
+                    if v:
+                        info[k] = v
+    except (socket.timeout, OSError):
+        return None
+    finally:
+        s.close()
+    if not info:
+        return None
+    a = model.resolve(ip=ip)
+    a.protocols.add("s7comm")
+    a.roles.add("s7_slave")
+    a.touch(now_iso())
+    for k, v in info.items():
+        if v:
+            a.attrs[f"s7_{k}"] = v
+    model.edges.pop((a.id, a.id, "s7comm"), None)   # probe artifact
+    return {"ip": ip, **info}
+
+
 def _probe_bacnet_whois(ip: str, model: Model, port: int = 47808, timeout: float = 1.5):
     """Unicast BACnet who-is to a specific device: any i-am reply proves a live
     BACnet device and its device-instance. Read-only."""
@@ -1677,7 +1752,8 @@ _ACTIVE_RUNNERS = {"arp_ping": _probe_arp, "tcp_probe": _probe_tcp,
                    "modbus_id": _probe_modbus_id, "enip_list": _probe_enip_list,
                    "mdns_query": _probe_mdns, "ssdp_msearch": _probe_ssdp,
                    "modbus_unit_sweep": _probe_modbus_unit_sweep,
-                   "bacnet_whois": _probe_bacnet_whois}
+                   "bacnet_whois": _probe_bacnet_whois,
+                   "s7_szl": _probe_s7_szl}
 
 # --------------------------------------------------------------------------
 # Flask app
