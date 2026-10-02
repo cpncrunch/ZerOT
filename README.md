@@ -54,7 +54,25 @@ python3 downstream.py export --format csv -o assets.csv
 
 ```
 sudo python3 downstream.py live --iface eth1 --scope scope.json
+sudo python3 downstream.py live --iface eth1 --scope scope.json --duration 3600 --snapshot 60
 ```
+
+Live mode folds fresh packets through the exact same two-pass pipeline as pcap
+ingest every `--snapshot` seconds (default 30), persisting state each time —
+so router-guard ordering and gateway-child materialization behave identically
+whether you ingest a file or sniff an interface. State accumulates across runs.
+
+## Diffing captures (day-over-day drift)
+
+```
+python3 downstream.py ingest day1.pcap --scope scope.json --db day1.json
+python3 downstream.py ingest day2.pcap --scope scope.json --db day2.json
+python3 downstream.py diff day1.json day2.json            # --json for machines
+```
+
+Reports new devices (with vendor/zone/roles), departed devices, new
+conversations, and new findings — a new device showing up on an OT network is
+itself a reportable observation.
 
 ## Layer crawling
 
@@ -93,7 +111,8 @@ the previous round learned. It stops when no new targets appear.
 
 **Write-class probes do not exist in this tool.** The technique registry is a
 closed set of read-only discovery methods (`arp_ping`, `tcp_probe`, `modbus_id`,
-`enip_list`, `mdns_query`, `ssdp_msearch`); unknown technique names are hard
+`enip_list`, `mdns_query`, `ssdp_msearch`,
+`modbus_unit_sweep`); unknown technique names are hard
 blocked at execution time.
 
 ## API (serve mode)
@@ -114,7 +133,7 @@ blocked at execution time.
 python3 -m pytest tests/ -q
 ```
 
-37 tests over the synthetic known-answer fixture: vendors, roles, edges,
+41 tests over the synthetic known-answer fixture: vendors, roles, edges,
 gateway/concentrator virtual children, router-guard, TTL hop inference, attack
 paths, smart-building/IoT devices (mDNS/SSDP/MQTT/KNX), IoT-on-OT findings,
 active gating (dry-run, unknown-technique block, confirm-requires-yes),

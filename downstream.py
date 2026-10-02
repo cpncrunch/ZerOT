@@ -356,33 +356,34 @@ class Model:
         return e
 
     # -- ingestion -----------------------------------------------------------
-    def ingest_packets(self, pkts) -> int:
-        from scapy.all import ARP, Ether, IP, TCP, UDP
-        n = 0
-        for pkt in pkts:
-            try:
-                if self.parse_packet(pkt, ARP=ARP, Ether=Ether, IP=IP, TCP=TCP, UDP=UDP):
-                    n += 1
-            except Exception:
-                continue
-        self.infer_roles()
-        self.compute_findings()
-        return n
-
     def ingest_pcap(self, path: str | Path) -> int:
-        from scapy.all import PcapReader, ARP as ARP_cls, Ether as Ether_cls, IP as IP_cls, UDP as UDP_cls
-        n = 0
+        from scapy.all import PcapReader
         pkts = []
         with PcapReader(str(path)) as rdr:
             for pkt in rdr:
                 pkts.append(pkt)
-        # pass 1 (identity), ordered so infrastructure is known before hosts:
-        #   1a. LLDP frames -> router/switch roles + mgmt IPs
-        #   1b. ARP + DHCP  -> MAC<->IP bindings
-        #   1c. all other IP frames -> MAC<->IP binding evidence
-        # The router guard depends on 1a preceding 1c.
+        n = self._ingest_batch(pkts)
+        self.log("ingest", f"{path}: {n} packets processed")
+        return n
+
+    def ingest_packets(self, pkts) -> int:
+        n = self._ingest_batch(list(pkts))
+        self.log("ingest", f"live batch: {n} packets processed")
+        return n
+
+    def _ingest_batch(self, pkts) -> int:
+        """Unified two-pass pipeline used by BOTH pcap and live ingestion:
+        pass 1 (identity) is ordered so infrastructure is known before hosts:
+          1a. LLDP frames -> router/switch roles + mgmt IPs
+          1b. ARP + PROFINET -> MAC<->IP bindings, L2 identity
+          1c. all other IP frames -> MAC<->IP binding evidence (+ DHCP)
+        The router guard depends on 1a preceding 1c."""
+        from scapy.all import ARP as ARP_cls, Ether as Ether_cls, IP as IP_cls, UDP as UDP_cls
+        n = 0
+
         def ts_of(p):
             return datetime.fromtimestamp(float(p.time), tz=timezone.utc).isoformat(timespec="seconds") if p.time else ""
+
         for pkt in pkts:
             eth = pkt.getlayer(Ether_cls)
             if eth is not None and eth.type == 0x88CC:
@@ -415,7 +416,6 @@ class Model:
                     n += 1
             except Exception:
                 continue
-        self.log("ingest", f"{path}: {n} packets processed")
         self.recompute()
         return n
 
@@ -1395,7 +1395,7 @@ class Model:
 
 # Registry: ONLY read-only discovery techniques exist. Write-class probes are
 # deliberately not implemented; requesting an unknown technique is a hard block.
-ACTIVE_TECHNIQUES = {"arp_ping", "tcp_probe", "modbus_id", "enip_list", "mdns_query", "ssdp_msearch"}
+ACTIVE_TECHNIQUES = {"arp_ping", "tcp_probe", "modbus_id", "enip_list", "mdns_query", "ssdp_msearch", "modbus_unit_sweep"}
 
 
 class ActivePlanner:
@@ -1504,37 +1504,53 @@ def _probe_tcp(ip: str, model: Model, ports=(502, 102, 44818, 20000, 4840, 22, 2
     return None
 
 
-def _probe_modbus_id(ip: str, model: Model, unit: int = 1, port: int = 502):
+def _probe_modbus_unit_sweep(ip: str, model: Model, port: int = 502,
+                             units: range = range(1, 25), timeout: float = 0.8):
+    """Enumerate Modbus unit-IDs behind a gateway: read-device-id (MEI 14) per
+    unit; a response (or an exception other than 'gateway target failed to
+    respond', 0x0B) proves a live PLC at that unit ID. Read-only."""
+    live = []
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(2.0)
     try:
         s.connect((ip, port))
-        pdu = bytes([0x2B, 0x0E, 0x01, 0x00])       # MEI 14 read device id, basic
-        req = struct.pack(">HHHB", 1, 0, 2 + len(pdu) + 1, unit) + pdu
-        s.send(req)
-        resp = s.recv(256)
+        for unit in units:
+            pdu = bytes([0x2B, 0x0E, 0x01, 0x00])      # MEI 14 read device id
+            req = struct.pack(">HHHB", unit, 0, 2 + 1 + len(pdu) + 1, unit) + pdu
+            try:
+                s.settimeout(timeout)
+                s.send(req)
+                resp = s.recv(256)
+            except (socket.timeout, OSError):
+                continue
+            if len(resp) < 9:
+                continue
+            fc = resp[7]
+            if fc & 0x80:
+                if fc != 0x8B:                          # 0x8B = gateway no-response
+                    live.append((resp[6], f"exception 0x{fc:02X}"))
+            else:
+                live.append((resp[6], "device-id response"))
     finally:
         s.close()
-    if len(resp) < 8:
+    if not live:
         return None
     a = model.resolve(ip=ip)
     a.protocols.add("modbus")
     a.touch(now_iso())
-    fc = resp[7]
-    out = {"ip": ip}
-    if fc & 0x80:
-        out["result"] = f"exception 0x{fc:02X} (device alive, no MEI support)"
-        a.attrs["modbus_exceptions"] = a.attrs.get("modbus_exceptions", 0) + 1
-    else:
-        out["result"] = "device identification responded"
-        a.attrs["modbus_device_id"] = True
-        try:
-            body = resp[9:]
-            vendor_len = body[0]
-            out["vendor"] = body[1:1 + vendor_len].decode("latin1", "replace")
-        except (IndexError, struct.error):
-            pass
-    return out
+    # record discovered units into the crawl stats so recompute() materializes
+    # virtual child PLCs for each one
+    for unit, _how in live:
+        model._mb_units.setdefault((a.id, unit), {"pkts": 1, "writes": 0})
+    if len(live) >= 2:
+        a.roles.add("modbus_gateway")
+    model.recompute()
+    return {"ip": ip, "units": sorted(u for u, _ in live)}
+
+
+def _probe_modbus_id(ip: str, model: Model, unit: int = 1, port: int = 502):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(2.0)
 
 
 def _probe_enip_list(ip: str, model: Model, port: int = 44818):
@@ -1598,7 +1614,8 @@ def _probe_ssdp(ip: str, model: Model):
 
 _ACTIVE_RUNNERS = {"arp_ping": _probe_arp, "tcp_probe": _probe_tcp,
                    "modbus_id": _probe_modbus_id, "enip_list": _probe_enip_list,
-                   "mdns_query": _probe_mdns, "ssdp_msearch": _probe_ssdp}
+                   "mdns_query": _probe_mdns, "ssdp_msearch": _probe_ssdp,
+                   "modbus_unit_sweep": _probe_modbus_unit_sweep}
 
 # --------------------------------------------------------------------------
 # Flask app
@@ -1718,6 +1735,35 @@ def create_app(model: Model):
 # CLI
 # --------------------------------------------------------------------------
 
+def diff_models(old: Model, new: Model) -> dict:
+    """Structural diff of two model states: new/departed assets, new edges,
+    new findings. Asset identity = id (MAC, ip:, or virtual child ids)."""
+    def a_dict(a, scope):
+        d = a.to_dict(scope)
+        d["zone"] = d["zone"]
+        return d
+    old_ids = set(old.assets)
+    new_ids = set(new.assets)
+    out = {
+        "new_assets": [a_dict(new.assets[i], new.scope) for i in sorted(new_ids - old_ids)],
+        "departed_assets": [a_dict(old.assets[i], old.scope) for i in sorted(old_ids - new_ids)],
+        "new_edges": [],
+        "new_findings": [],
+    }
+    old_edges = set(old.edges)
+    lbl = lambda m, i: m.assets[i].label if i in m.assets else i
+    for k in new.edges:
+        if k not in old_edges:
+            out["new_edges"].append({"source": k[0], "target": k[1], "proto": k[2],
+                                     "source_label": lbl(new, k[0]),
+                                     "target_label": lbl(new, k[1])})
+    old_f = {f["id"] for f in old.findings}
+    for f in new.findings:
+        if f["id"] not in old_f:
+            out["new_findings"].append({"id": f["id"], "severity": f["severity"], "title": f["title"]})
+    return out
+
+
 def main(argv=None):
     import argparse
     ap = argparse.ArgumentParser(prog="downstream", description=__doc__,
@@ -1734,6 +1780,7 @@ def main(argv=None):
     p.add_argument("--scope", default=None)
     p.add_argument("--db", default=str(ROOT / "data" / "state.json"))
     p.add_argument("--duration", type=int, default=0, help="seconds; 0 = until Ctrl-C")
+    p.add_argument("--snapshot", type=int, default=30, help="seconds between state snapshots (0 = off)")
 
     p = sub.add_parser("active", help="gated active discovery (dry-run by default)")
     p.add_argument("--scope", required=True)
@@ -1748,6 +1795,11 @@ def main(argv=None):
     p.add_argument("--max-rounds", type=int, default=3)
     p.add_argument("--execute", action="store_true", help="actually send probes")
     p.add_argument("--yes", action="store_true", help="acknowledge 'confirm' decisions")
+
+    p = sub.add_parser("diff", help="compare two saved states (new/departed devices, new edges)")
+    p.add_argument("old")
+    p.add_argument("new")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
 
     p = sub.add_parser("export", help="export graph/assets from a saved state")
     p.add_argument("--db", default=str(ROOT / "data" / "state.json"))
@@ -1773,22 +1825,39 @@ def main(argv=None):
     elif args.cmd == "live":
         from scapy.all import AsyncSniffer
         scope = Scope.load(args.scope) if args.scope else Scope()
-        model = Model(scope)
+        model = Model.load(args.db) if Path(args.db).exists() else Model(scope)
+        model.scope = scope
         sniffer = AsyncSniffer(iface=args.iface, store=True)
         sniffer.start()
         print(f"[*] sniffing on {args.iface} (Ctrl-C to stop)" + (f" for {args.duration}s" if args.duration else ""))
+        processed = 0
         try:
-            if args.duration:
-                time.sleep(args.duration)
-            else:
-                while True:
-                    time.sleep(1)
+            t0 = time.time()
+            next_snap = t0 + args.snapshot
+            while True:
+                time.sleep(1)
+                now = time.time()
+                if args.duration and now - t0 >= args.duration:
+                    break
+                if args.snapshot and now >= next_snap:
+                    next_snap = now + args.snapshot
+                    # fold fresh packets through the full two-pass pipeline so
+                    # identity ordering + gateway materialization stay correct
+                    fresh = sniffer.results[processed:] if sniffer.results else []
+                    processed += len(fresh)
+                    if fresh:
+                        n = model.ingest_packets(fresh)
+                        model.save(args.db)
+                        print(f"[*] snapshot: +{len(fresh)} pkts -> {len(model.assets)} assets "
+                              f"({len(model.findings)} findings)")
         except KeyboardInterrupt:
             pass
         pkts = sniffer.stop()
-        n = model.ingest_packets(pkts)
+        remaining = sniffer.results[processed:] if sniffer.results else []
+        if remaining:
+            model.ingest_packets(remaining)
         model.save(args.db)
-        print(f"[+] {n} packets -> {len(model.assets)} assets -> {args.db}")
+        print(f"[+] {processed + len(remaining)} packets -> {len(model.assets)} assets -> {args.db}")
 
     elif args.cmd == "active":
         scope = Scope.load(args.scope)
@@ -1850,6 +1919,33 @@ def main(argv=None):
                 break
         model.save(args.db)
         print(f"[+] {len(model.assets)} assets, {len(model.edges)} conversations -> {args.db}")
+
+    elif args.cmd == "diff":
+        old_m = Model.load(args.old)
+        new_m = Model.load(args.new)
+        d = diff_models(old_m, new_m)
+        if args.json:
+            print(json.dumps(d, indent=1))
+        else:
+            if d["new_assets"]:
+                print("[+] NEW DEVICES:")
+                for a in d["new_assets"]:
+                    print(f"    {a['label']:24} {a['vendor'] or '?':24} {a['zone']:12} {','.join(a['roles'])}")
+            if d["departed_assets"]:
+                print("[-] DEPARTED (present before, absent now):")
+                for a in d["departed_assets"]:
+                    print(f"    {a['label']:24} {a['vendor'] or '?':24} {a['zone']:12}")
+            if d["new_edges"]:
+                print("[+] NEW CONVERSATIONS:")
+                for e in d["new_edges"]:
+                    print(f"    {e['source_label']} -> {e['target_label']} ({e['proto']})")
+            if d["new_findings"]:
+                print("[!] NEW FINDINGS:")
+                for f in d["new_findings"]:
+                    print(f"    [{f['severity'].upper()}] {f['title']}")
+            if not (d["new_assets"] or d["departed_assets"] or d["new_edges"] or d["new_findings"]):
+                print("[*] no differences")
+        return 0
 
     elif args.cmd == "export":
         model = Model.load(args.db)

@@ -1,5 +1,6 @@
 """Downstream tests: fixture-driven passive pipeline, roles, findings, zones, exports, gating."""
 import json
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -359,7 +360,136 @@ def test_save_load_roundtrip(tmp_path, model):
     assert {f["id"] for f in m2.findings} == {f["id"] for f in model.findings}
 
 
-# ---- CLI smoke --------------------------------------------------------------- #
+# ---- diff ------------------------------------------------------------------- #
+
+def test_diff_detects_new_devices_and_edges(model, tmp_path):
+    old = Model(Scope(SCOPE))
+    old.ingest_pcap(FIXTURE)
+    old_db = tmp_path / "old.json"
+    old.save(old_db)
+
+    # a second capture: same plant + a rogue contractor laptop polling the PLC
+    import scapy.all as sa
+    from scapy.utils import wrpcap
+    pkts = list(sa.PcapReader(str(FIXTURE)))
+    extra = []
+    mac_r = "d4:8a:fc:aa:05:99"
+    ip_r = "10.20.5.99"
+    req = struct.pack(">HHHB", 500, 0, 6, 1) + bytes([3]) + struct.pack(">HH", 0, 4)
+    resp = struct.pack(">HHHB", 500, 0, 9, 1) + bytes([3, 8]) + b"\x00" * 8
+    extra.append(sa.Ether(src=mac_r, dst="00:80:f4:aa:05:12") / sa.IP(src=ip_r, dst="10.20.5.12") /
+                 sa.TCP(sport=46000, dport=502, flags="PA", seq=1, ack=1) / sa.Raw(load=req))
+    extra.append(sa.Ether(src="00:80:f4:aa:05:12", dst=mac_r) / sa.IP(src="10.20.5.12", dst=ip_r) /
+                 sa.TCP(sport=502, dport=46000, flags="PA", seq=1, ack=1) / sa.Raw(load=resp))
+    extra_pcap = tmp_path / "day2.pcap"
+    wrpcap(str(extra_pcap), extra)
+
+    new = Model(Scope(SCOPE))
+    new.ingest_pcap(FIXTURE)
+    new.ingest_pcap(extra_pcap)
+
+    d = ds.diff_models(old, new)
+    labels = [a["label"] for a in d["new_assets"]]
+    assert "10.20.5.99" in labels
+    rogue = [a for a in d["new_assets"] if a["label"] == "10.20.5.99"][0]
+    assert "Espressif Inc." in rogue["vendor"]
+    assert "master" in rogue["roles"]
+    edge_strs = [f"{e['source_label']}->{e['target_label']}" for e in d["new_edges"]]
+    assert any("10.20.5.12" in s for s in edge_strs)
+    assert d["departed_assets"] == []
+
+
+def test_diff_departed_and_no_change(model, tmp_path):
+    old = Model(Scope(SCOPE))
+    old.ingest_pcap(FIXTURE)
+    # build a reduced model: only the BACnet packets
+    import scapy.all as sa
+    pkts = [p for p in sa.PcapReader(str(FIXTURE)) if p.haslayer(sa.UDP) and p[sa.UDP].dport == 47808]
+    small = Model(Scope(SCOPE))
+    small.ingest_packets(pkts)
+    d = ds.diff_models(old, small)
+    assert len(d["departed_assets"]) >= 10
+    assert d["new_assets"] == []
+    # identical models -> empty diff
+    d2 = ds.diff_models(old, old)
+    assert d2["new_assets"] == [] and d2["new_edges"] == []
+
+
+# ---- live-mode pipeline parity ----------------------------------------------- #
+
+def test_ingest_packets_recompute_equivalence(model):
+    """ingest_packets (live path) must produce the same gateway children and
+    findings as ingest_pcap (two-pass path) for identical packets."""
+    import scapy.all as sa
+    pkts = list(sa.PcapReader(str(FIXTURE)))
+    live = Model(Scope(SCOPE))
+    live.ingest_packets(pkts)
+    pcap = Model(Scope(SCOPE))
+    pcap.ingest_pcap(FIXTURE)
+    assert {a.id for a in live.assets.values()} == {a.id for a in pcap.assets.values()}
+    assert set(live.edges) == set(pcap.edges)
+    kids = [a for a in live.assets.values() if "#" in a.id]
+    assert len(kids) == 3       # u17, u18, d7 children present in live path too
+
+
+# ---- active: modbus unit sweep against a fixture gateway ---------------------- #
+
+def test_modbus_unit_sweep_against_fixture_gateway(model):
+    """Fake Modbus/TCP gateway: unit 5 + 9 respond with device-id, unit 2
+    answers illegal-function (exists), others -> gateway no-response 0x8B."""
+    import threading
+
+    def mbap_resp(txid, unit, payload):
+        return struct.pack(">HHHB", txid, 0, 3 + len(payload), unit) + payload
+
+    live_units = {5, 9}          # device-id responders
+    exists_units = {2}           # illegal-function exception (device present)
+    hit_log = []
+
+    def serve():
+        conn, _ = srv.accept()
+        with conn:
+            while True:
+                try:
+                    data = conn.recv(512)
+                except OSError:
+                    return
+                if not data or len(data) < 8:
+                    return
+                unit = data[6]
+                if unit in live_units:
+                    # device-id basic: conformity 0x83 (individual), more-follows 0
+                    body = bytes([0x2B, 0x0E, 0x01, 0x00, 0x83, 0x00, 5]) + b"PLCX" + b"\x00\x00"
+                    conn.sendall(struct.pack(">HHHB", struct.unpack(">H", data[:2])[0], 0,
+                                             3 + len(body), unit) + body)
+                elif unit in exists_units:
+                    conn.sendall(struct.pack(">HHHB", struct.unpack(">H", data[:2])[0], 0,
+                                             4, unit) + bytes([0xAB, 0x01]))
+                else:
+                    conn.sendall(struct.pack(">HHHB", struct.unpack(">H", data[:2])[0], 0,
+                                             4, unit) + bytes([0x8B, 0x01]))
+
+    import socket as sk
+    srv = sk.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+
+    m2 = Model(Scope(SCOPE))
+    res = ds._probe_modbus_unit_sweep("127.0.0.1", m2, port=port, units=range(1, 12), timeout=0.5)
+    srv.close()
+    assert res is not None
+    assert set(res["units"]) == {2, 5, 9}
+    # virtual children materialized from sweep results
+    gw = m2.assets.get("ip:127.0.0.1")
+    assert gw is not None and "modbus_gateway" in gw.roles
+    kids = [a for a in m2.assets.values() if a.attrs.get("behind_gateway") == gw.id]
+    assert {k.attrs.get("modbus_unit") for k in kids} == {2, 5, 9}
+
+
+
 
 def test_cli_ingest_and_export(tmp_path):
     scope_file = tmp_path / "scope.json"
