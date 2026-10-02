@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Downstream — passive-first OT/ICS asset discovery with BloodHound-style graphing.
+"""ZerOT — passive-first OT/ICS asset discovery with BloodHound-style graphing.
 
-Architecture (single-file, Deadfall pattern):
+Architecture (single-file, ZerOT pattern):
   - Model: asset/edge/finding store, MAC<->IP merge, OUI vendor enrichment
   - Passive dissectors: modbus, s7comm, enip, dnp3, opcua, bacnet, lldp,
     profinet dcp/rt, nbns, dhcp, arp
@@ -14,11 +14,11 @@ Architecture (single-file, Deadfall pattern):
   - Flask API + vendored-d3 single-file UI (air-gap friendly)
 
 Usage:
-  downstream.py ingest <pcap...> [--scope scope.json] [--db state.json]
-  downstream.py live --iface <iface> [--scope ...] [--db ...]
-  downstream.py active --scope scope.json [--plan-only|--execute [--yes]]
-  downstream.py export --db state.json --format dot|svg|png|csv|md|json [-o out]
-  downstream.py serve [--port 8756] [--db state.json]
+  zerot.py ingest <pcap...> [--scope scope.json] [--db state.json]
+  zerot.py live --iface <iface> [--scope ...] [--db ...]
+  zerot.py active --scope scope.json [--plan-only|--execute [--yes]]
+  zerot.py export --db state.json --format dot|svg|png|csv|md|json [-o out]
+  zerot.py serve [--port 8756] [--db state.json]
 """
 from __future__ import annotations
 
@@ -1304,7 +1304,7 @@ class Model:
                        "Enterprise": "#7a4a8c", "L4/L5": "#7a4a8c"}
         ROLE_SHAPES = {"plc": "box", "rtu": "box", "switch": "hexagon", "gateway": "tripleoctagon",
                        "scada_server": "cylinder", "engineering_ws": "rect", "master": "diamond"}
-        lines = ["digraph downstream {", '  rankdir=LR;', '  bgcolor="#111318";',
+        lines = ["digraph zerot {", '  rankdir=LR;', '  bgcolor="#111318";',
                  '  node [style="filled,solid" fontname="Helvetica" fontcolor="#e8e8e8" color="#3a3f4b"];',
                  '  edge [fontname="Helvetica" fontcolor="#9aa0ad" color="#5a6070"];']
         zones = {}
@@ -1366,7 +1366,7 @@ class Model:
 
     def report_md(self) -> str:
         sc = self.scope
-        lines = [f"# Downstream OT asset report", "",
+        lines = [f"# ZerOT OT asset report", "",
                  f"- Generated: {now_iso()}", f"- Scope: {sc.data.get('name')}",
                  f"- Assets: {len(self.assets)}  Conversations: {len(self.edges)}  Findings: {len(self.findings)}",
                  "", "## Findings", ""]
@@ -2092,32 +2092,32 @@ def diff_models(old: Model, new: Model) -> dict:
 
 def main(argv=None):
     import argparse
-    ap = argparse.ArgumentParser(prog="downstream", description=__doc__,
+    ap = argparse.ArgumentParser(prog="zerot", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("ingest", help="passive ingest of pcap files")
     p.add_argument("pcaps", nargs="+")
     p.add_argument("--scope", default=None)
-    p.add_argument("--db", default=str(ROOT / "data" / "state.json"))
+    p.add_argument("--db", default=str(ROOT / "data" / "zerot_state.json"))
 
     p = sub.add_parser("live", help="passive live capture on an interface")
     p.add_argument("--iface", required=True)
     p.add_argument("--scope", default=None)
-    p.add_argument("--db", default=str(ROOT / "data" / "state.json"))
+    p.add_argument("--db", default=str(ROOT / "data" / "zerot_state.json"))
     p.add_argument("--duration", type=int, default=0, help="seconds; 0 = until Ctrl-C")
     p.add_argument("--snapshot", type=int, default=30, help="seconds between state snapshots (0 = off)")
 
     p = sub.add_parser("active", help="gated active discovery (dry-run by default)")
     p.add_argument("--scope", required=True)
-    p.add_argument("--db", default=str(ROOT / "data" / "state.json"))
+    p.add_argument("--db", default=str(ROOT / "data" / "zerot_state.json"))
     p.add_argument("--plan-only", action="store_true")
     p.add_argument("--execute", action="store_true", help="actually send probes")
     p.add_argument("--yes", action="store_true", help="acknowledge 'confirm' decisions")
 
     p = sub.add_parser("crawl", help="iterative gated discovery: suggest or run next-layer probes")
     p.add_argument("--scope", required=True)
-    p.add_argument("--db", default=str(ROOT / "data" / "state.json"))
+    p.add_argument("--db", default=str(ROOT / "data" / "zerot_state.json"))
     p.add_argument("--max-rounds", type=int, default=3)
     p.add_argument("--execute", action="store_true", help="actually send probes")
     p.add_argument("--yes", action="store_true", help="acknowledge 'confirm' decisions")
@@ -2128,18 +2128,18 @@ def main(argv=None):
     p.add_argument("--json", action="store_true", help="machine-readable output")
 
     p = sub.add_parser("export", help="export graph/assets from a saved state")
-    p.add_argument("--db", default=str(ROOT / "data" / "state.json"))
+    p.add_argument("--db", default=str(ROOT / "data" / "zerot_state.json"))
     p.add_argument("--format", default="md", choices=["dot", "svg", "png", "csv", "edges.csv", "md", "json"])
     p.add_argument("-o", "--output", default=None)
 
     p = sub.add_parser("import-nmap", help="fuse an nmap XML export into the model")
     p.add_argument("xml", nargs="+")
     p.add_argument("--scope", default=None)
-    p.add_argument("--db", default=str(ROOT / "data" / "state.json"))
+    p.add_argument("--db", default=str(ROOT / "data" / "zerot_state.json"))
 
     p = sub.add_parser("serve", help="launch the web UI")
     p.add_argument("--port", type=int, default=8756)
-    p.add_argument("--db", default=str(ROOT / "data" / "state.json"))
+    p.add_argument("--db", default=str(ROOT / "data" / "zerot_state.json"))
     p.add_argument("--scope", default=None)
 
     args = ap.parse_args(argv)
@@ -2308,7 +2308,7 @@ def main(argv=None):
                 print(f"dot error: {r.stderr.decode()[:300]}", file=sys.stderr)
                 return 1
             out = None
-            dest = args.output or f"downstream_graph.{args.format}"
+            dest = args.output or f"zerot_graph.{args.format}"
             Path(dest).write_bytes(r.stdout)
             print(f"[+] wrote {dest}")
             return 0
@@ -2329,7 +2329,7 @@ def main(argv=None):
             scope = Scope.load(args.scope) if args.scope else Scope()
             model = Model(scope)
         app = create_app(model)
-        print(f"[*] Downstream UI: http://127.0.0.1:{args.port}  (db: {db})")
+        print(f"[*] ZerOT UI: http://127.0.0.1:{args.port}  (db: {db})")
         app.run(host="0.0.0.0", port=args.port, debug=False)
 
     return 0

@@ -1,5 +1,5 @@
 [project]
-name = "downstream-ot"
+name = "zerot"
 version = "0.4.0"
 description = "Passive-first OT/ICS asset discovery with BloodHound-style graphing and a gated read-only active layer"
 readme = "README.md"
@@ -19,10 +19,10 @@ dependencies = [
 ]
 
 [project.scripts]
-downstream = "downstream:main"
+zerot = "zerot:main"
 
 [project.urls]
-Homepage = "https://github.com/iprivett/downstream"
+Homepage = "https://github.com/iprivett/ZerOT"
 
 [build-system]
 requires = ["hatchling"]
@@ -31,11 +31,11 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 # single-file module: ship the module plus the static UI and data files it
 # loads relative to its own location (ROOT = Path(__file__).parent)
-only-include = ["downstream.py"]
+only-include = ["zerot.py"]
 force-include = { "static" = "static", "data" = "data" }
 
 [tool.hatch.build.targets.sdist]
-only-include = ["downstream.py", "static", "data", "tests", "scripts", "README.md"]
+only-include = ["zerot.py", "static", "data", "tests", "scripts", "README.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

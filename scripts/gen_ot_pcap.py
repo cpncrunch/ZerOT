@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""gen_ot_pcap.py — synthetic known-answer OT network PCAP for Downstream.
+"""gen_ot_pcap.py — synthetic known-answer OT network PCAP for ZerOT.
 
 Generates tests/fixtures/ot_plant.pcap: a small brewery process-control
 network with known devices, protocols, and relationships. The expected
 outcomes below are asserted by tests/test_passive.py; if you change this
 fixture, change the tests (and this header) in the same commit.
 
-  DOWNSTREAM TEST PLANT  (10.20.0.0/16)
+  ZEROT TEST PLANT  (10.20.0.0/16)
 
   L1 control (10.20.5.0/24):
     10.20.5.11  00:0e:8c:aa:05:11  Siemens S7-1200 PLC "TANK_FARM_A"   (S7 slave,  tcp/102)
@@ -156,7 +156,7 @@ def enip_list_identity_resp_body(product=b"1756-L83E", vendor=1):
     ident += bytes([len(product)]) + product + bytes([0x04])         # product name, state
     item2 = struct.pack("<HH", 0x000C, len(sockaddr + ident)) + sockaddr + ident
     return struct.pack("<H", 1) + item2                              # item count, null-addr wrapped
-    # NOTE: downstream parses defensively; fixture layout = count(2) + item(type,len,sockaddr,identity)
+    # NOTE: zerot parses defensively; fixture layout = count(2) + item(type,len,sockaddr,identity)
 
 def enip_flow(client, server):
     out = []
@@ -366,7 +366,7 @@ def dhcp_discover(hostname):
     return msg + b"\x63\x82\x53\x63" + opt53 + opt12 + opt55 + b"\xff"
 
 # --- mDNS / SSDP / MQTT / KNX ------------------------------------------------ #
-def mdns_ptr_response(instance="Downstream Thermostat", svc="_hap._tcp", ip="10.20.5.60"):
+def mdns_ptr_response(instance="ZerOT Thermostat", svc="_hap._tcp", ip="10.20.5.60"):
     """PTR answer + SRV + TXT + A records for a HomeKit-style announce."""
     def name(n):  # dotted dns name -> label encoding (splits on '.')
         out = b""
@@ -381,7 +381,7 @@ def mdns_ptr_response(instance="Downstream Thermostat", svc="_hap._tcp", ip="10.
     host_q = name(instance + ".local")
     answers = rr(inst_q, 12, 120, svc_q)                       # PTR
     authority = rr(svc_q, 33, 120, name(instance) + struct.pack(">HIII", 8080, 0, 0, 8080))  # SRV
-    additional = rr(svc_q, 16, 120, name("md=Downstream") + name("pv=1.0"))  # TXT
+    additional = rr(svc_q, 16, 120, name("md=ZerOT") + name("pv=1.0"))  # TXT
     additional += rr(host_q, 1, 120, bytes(int(o) for o in ip.split(".")))  # A
     hdr = struct.pack(">HHHHHH", 0x0000, 0x8400, 0, 1, 1, 2)   # id=0, flags=response
     return hdr + answers + authority + additional
@@ -396,7 +396,7 @@ def ssdp_msearch_alive(product="Honeywell TH-IP", ip="10.20.5.61"):
     msearch = (b"M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
                b"MAN: \"ssdp:discover\"\r\nMX: 2\r\nST: upnp:rootdevice\r\n\r\n")
     alive = (b"NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
-             b"NT: upnp:rootdevice\r\nNTS: ssdp:alive\r\nUSN: uuid:downstream-"
+             b"NT: upnp:rootdevice\r\nNTS: ssdp:alive\r\nUSN: uuid:zerot-"
              + product.replace(" ", "-").encode() + b"\r\nSERVER: " + product.encode()
              + b" UPnP/1.0\r\nLOCATION: http://" + ip.encode() + b"/desc.xml\r\n\r\n")
     return msearch, alive

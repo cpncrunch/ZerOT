@@ -1,4 +1,4 @@
-# Downstream
+# ZerOT
 
 Passive-first OT/ICS asset discovery with BloodHound-style graphing. Maps
 control networks layer by layer — including PLCs hidden behind Modbus/TCP
@@ -33,7 +33,7 @@ pip install scapy flask
 sudo apt install graphviz              # optional, for svg/png export
 ```
 
-Or install as a package (adds the `downstream` console command):
+Or install as a package (adds the `zerot` console command):
 
 ```
 pip install .
@@ -46,23 +46,23 @@ pip install .
 python3 scripts/gen_ot_pcap.py
 
 # passive ingest with Purdue zoning
-python3 downstream.py ingest tests/fixtures/ot_plant.pcap --scope data/scope.example.json
+python3 zerot.py ingest tests/fixtures/ot_plant.pcap --scope data/scope.example.json
 
 # explore
-python3 downstream.py serve --scope data/scope.example.json
+python3 zerot.py serve --scope data/scope.example.json
 # -> http://127.0.0.1:8756  (graph, filters, findings, Attack paths button)
 
 # exports for the report
-python3 downstream.py export --format md    # findings + assets + paths
-python3 downstream.py export --format svg -o plant.svg
-python3 downstream.py export --format csv -o assets.csv
+python3 zerot.py export --format md    # findings + assets + paths
+python3 zerot.py export --format svg -o plant.svg
+python3 zerot.py export --format csv -o assets.csv
 ```
 
 ## Live capture
 
 ```
-sudo python3 downstream.py live --iface eth1 --scope scope.json
-sudo python3 downstream.py live --iface eth1 --scope scope.json --duration 3600 --snapshot 60
+sudo python3 zerot.py live --iface eth1 --scope scope.json
+sudo python3 zerot.py live --iface eth1 --scope scope.json --duration 3600 --snapshot 60
 ```
 
 Live mode folds fresh packets through the exact same two-pass pipeline as pcap
@@ -78,8 +78,8 @@ OS guess, product/version, open ports) or add nmap-only assets:
 
 ```
 nmap -sV -O 10.20.5.0/24 -oX plant.xml
-python3 downstream.py ingest plant.pcap --scope scope.json --db state.json
-python3 downstream.py import-nmap plant.xml --scope scope.json --db state.json
+python3 zerot.py ingest plant.pcap --scope scope.json --db state.json
+python3 zerot.py import-nmap plant.xml --scope scope.json --db state.json
 ```
 
 ## Product → CVE enrichment (offline)
@@ -102,9 +102,9 @@ and round-trips through save/load. The UI shows it in the asset detail panel.
 ## Diffing captures (day-over-day drift)
 
 ```
-python3 downstream.py ingest day1.pcap --scope scope.json --db day1.json
-python3 downstream.py ingest day2.pcap --scope scope.json --db day2.json
-python3 downstream.py diff day1.json day2.json            # --json for machines
+python3 zerot.py ingest day1.pcap --scope scope.json --db day1.json
+python3 zerot.py ingest day2.pcap --scope scope.json --db day2.json
+python3 zerot.py diff day1.json day2.json            # --json for machines
 ```
 
 Reports new devices (with vendor/zone/roles), departed devices, new
@@ -114,8 +114,8 @@ itself a reportable observation.
 ## Layer crawling
 
 ```
-python3 downstream.py crawl --scope scope.json            # dry-run: shows next targets
-sudo python3 downstream.py crawl --scope scope.json --execute --yes
+python3 zerot.py crawl --scope scope.json            # dry-run: shows next targets
+sudo python3 zerot.py crawl --scope scope.json --execute --yes
 ```
 
 Crawl analysis is driven by what the graph already knows:

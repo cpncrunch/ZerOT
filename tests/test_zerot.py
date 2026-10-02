@@ -1,4 +1,4 @@
-"""Downstream tests: fixture-driven passive pipeline, roles, findings, zones, exports, gating."""
+"""ZerOT tests: fixture-driven passive pipeline, roles, findings, zones, exports, gating."""
 import json
 import struct
 import subprocess
@@ -10,13 +10,13 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-import downstream as ds
-from downstream import Model, Scope
+import zerot as ds
+from zerot import Model, Scope
 
 FIXTURE = ROOT / "tests" / "fixtures" / "ot_plant.pcap"
 
 SCOPE = {
-    "name": "Downstream test plant",
+    "name": "ZerOT test plant",
     "zones": {"L1": ["10.20.5.0/24"], "L2_L3": ["10.20.7.0/24"], "Enterprise": ["10.20.9.0/24"]},
     "excluded": [],
     "active": {"enabled": True, "techniques": {"arp_ping": "allow", "tcp_probe": "confirm",
@@ -240,10 +240,10 @@ def test_mdns_thermostat(model):
     m = by_ip(model)
     th = m["10.20.5.60"]
     assert "iot_device" in th.roles
-    assert "Downstream Thermostat" in th.hostnames
+    assert "ZerOT Thermostat" in th.hostnames
     assert any("_hap._tcp" in s for s in th.attrs.get("mdns_services", []))
     assert th.attrs.get("iot_platform") == "HomeKit"
-    assert th.attrs.get("model") == "Downstream"
+    assert th.attrs.get("model") == "ZerOT"
     assert th.vendor == "Espressif Inc."
     assert th.zone(model.scope) == "L1"          # it's on the control subnet
 
@@ -254,7 +254,7 @@ def test_ssdp_thermostat(model):
     assert "iot_device" in th.roles
     assert th.vendor.startswith("Honeywell")
     assert th.attrs.get("upnp_server") == "Honeywell TH-IP UPnP/1.0"
-    assert "uuid:downstream-Honeywell-TH-IP" in th.attrs.get("upnp_usn", "")
+    assert "uuid:zerot-Honeywell-TH-IP" in th.attrs.get("upnp_usn", "")
 
 
 def test_mqtt_client_and_broker(model):
@@ -510,12 +510,12 @@ def test_cli_ingest_and_export(tmp_path):
     scope_file = tmp_path / "scope.json"
     scope_file.write_text(json.dumps(SCOPE))
     db = tmp_path / "state.json"
-    r = subprocess.run([sys.executable, str(ROOT / "downstream.py"), "ingest", str(FIXTURE),
+    r = subprocess.run([sys.executable, str(ROOT / "zerot.py"), "ingest", str(FIXTURE),
                         "--scope", str(scope_file), "--db", str(db)],
                        capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stderr
     assert "assets" in r.stdout
-    r2 = subprocess.run([sys.executable, str(ROOT / "downstream.py"), "export", "--db", str(db),
+    r2 = subprocess.run([sys.executable, str(ROOT / "zerot.py"), "export", "--db", str(db),
                          "--format", "dot"], capture_output=True, text=True, timeout=60)
     assert r2.returncode == 0, r2.stderr
     assert "digraph" in r2.stdout
@@ -524,7 +524,7 @@ def test_cli_ingest_and_export(tmp_path):
 def test_cli_active_dryrun(tmp_path):
     scope_file = tmp_path / "scope.json"
     scope_file.write_text(json.dumps(SCOPE))
-    r = subprocess.run([sys.executable, str(ROOT / "downstream.py"), "active", "--scope", str(scope_file)],
+    r = subprocess.run([sys.executable, str(ROOT / "zerot.py"), "active", "--scope", str(scope_file)],
                        capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stderr
     assert "dry-run" in r.stdout

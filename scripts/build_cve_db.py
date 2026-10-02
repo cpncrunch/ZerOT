@@ -17,7 +17,7 @@ OUT = Path(__file__).resolve().parent.parent / "data" / "ot_cves.json"
 API = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
 # product families the tool can already identify:
-#   keys -> where Downstream extracts the product string today
+#   keys -> where ZerOT extracts the product string today
 PRODUCTS = {
     "Allen-Bradley ControlLogix 1756": ["ControlLogix 1756", "1756-L", "1756-ENBT"],
     "Allen-Bradley Micro800": ["Micro830", "Micro850", "Micro870"],
@@ -45,7 +45,7 @@ def nvd_query(kw, retries=4):
     for attempt in range(retries):
         try:
             url = f"{API}?keywordSearch={urllib.parse.quote(kw)}&resultsPerPage=60"
-            req = urllib.request.Request(url, headers={"User-Agent": "downstream-cve-builder"})
+            req = urllib.request.Request(url, headers={"User-Agent": "zerot-cve-builder"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 return json.load(r)
         except Exception as ex:
