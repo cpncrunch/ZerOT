@@ -70,6 +70,25 @@ ingest every `--snapshot` seconds (default 30), persisting state each time —
 so router-guard ordering and gateway-child materialization behave identically
 whether you ingest a file or sniff an interface. State accumulates across runs.
 
+## Importing nmap scans
+
+Fuse existing nmap XML exports into the same model — imported facts are
+source-tagged (`nmap:<file>`) and enrich passively-observed assets (hostname,
+OS guess, product/version, open ports) or add nmap-only assets:
+
+```
+nmap -sV -O 10.20.5.0/24 -oX plant.xml
+python3 downstream.py ingest plant.pcap --scope scope.json --db state.json
+python3 downstream.py import-nmap plant.xml --scope scope.json --db state.json
+```
+
+## Evidence provenance
+
+Every asset, conversation, and finding carries citation records — source pcap
+file, frame number, timestamp — so any claim in the report can be replayed in
+Wireshark (`frame.number == N`). Evidence is capped per object (first + latest)
+and round-trips through save/load. The UI shows it in the asset detail panel.
+
 ## Diffing captures (day-over-day drift)
 
 ```
@@ -141,7 +160,7 @@ blocked at execution time.
 python3 -m pytest tests/ -q
 ```
 
-45 tests over the synthetic known-answer fixture: vendors, roles, edges,
+47 tests over the synthetic known-answer fixture: vendors, roles, edges,
 gateway/concentrator virtual children, router-guard, TTL hop inference, attack
 paths, smart-building/IoT devices (mDNS/SSDP/MQTT/KNX), IoT-on-OT findings,
 active gating (dry-run, unknown-technique block, confirm-requires-yes),

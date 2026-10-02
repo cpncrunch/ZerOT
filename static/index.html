@@ -54,6 +54,8 @@
   .finding .t { color: var(--text); margin: 3px 0; }
   .finding .d { color: var(--dim); font-size: 12px; }
   table.kv { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .evidence .ev { border: 1px solid var(--border); border-radius: 4px; padding: 4px 6px;
+                  margin: 3px 0; font-size: 11px; background: var(--panel2); }
   table.kv td { padding: 3px 6px 3px 0; vertical-align: top; border-bottom: 1px solid #21262d; }
   table.kv td:first-child { color: var(--dim); white-space: nowrap; width: 95px; }
   .proto-tag { display: inline-block; background: #21262d; border: 1px solid var(--border); color: var(--accent); border-radius: 4px; padding: 1px 6px; margin: 1px 2px 1px 0; font-size: 11px; font-family: ui-monospace, monospace; }
@@ -331,7 +333,26 @@ function showDetail(n) {
       <tr><td>Packets</td><td>${n.pkt_count}</td></tr>
       <tr><td>First / last</td><td>${esc(n.first_seen)}<br>${esc(n.last_seen)}</td></tr>
     </table>
+    ${evidenceBlock(n.evidence)}
     <h3>Conversations</h3>${talk || "<div style='color:var(--dim)'>none observed</div>"}`;
+  bindNeighbors();
+}
+
+function evidenceBlock(ev) {
+  if (!ev || !ev.length) return "";
+  const rows = ev.slice(0, 8).map(e => {
+    const where = e.frame != null ? `frame ${e.frame}` : "";
+    const short = e.source.split("/").pop();
+    return `<div class="ev">` +
+      `<span class="proto-tag">${esc(short)}</span> ` +
+      `<span style="font-family:ui-monospace,monospace">${esc(where)}</span>` +
+      `${e.ts ? ` <span style="color:var(--dim)">${esc(e.ts.split("T")[1] || "")}</span>` : ""}` +
+      `${e.detail ? `<br><span style="color:var(--dim)">${esc(e.detail)}</span>` : ""}</div>`;
+  }).join("");
+  return `<h3>Evidence</h3><div class="evidence">${rows}</div>`;
+}
+
+function bindNeighbors() {
   $("#detail").querySelectorAll(".neighbor").forEach(el =>
     el.addEventListener("click", () => {
       const t = G.nodes.find(x => x.id === el.dataset.id);

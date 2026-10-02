@@ -168,6 +168,8 @@ class Asset:
         self.first_seen = ""
         self.last_seen = ""
         self.id_override = ""
+        # evidence provenance: capped list of {source, frame?, ts?, detail?}
+        self.evidence: list[dict] = []
         self._refresh_vendor()
 
     def _refresh_vendor(self):
@@ -230,6 +232,7 @@ class Asset:
             "last_seen": self.last_seen,
             "unmanaged": self.is_unmanaged(scope),
             "attributes": self.attrs,
+            "evidence": self.evidence,
         }
 
 
@@ -240,6 +243,9 @@ class Edge:
         self.writes = 0
         self.exceptions = 0
         self.first_seen = self.last_seen = ""
+        # evidence provenance: capped list of {source, frame, ts}
+        self.evidence: list[dict] = []
+        self.evidence_total = 0
 
     def touch(self, ts=""):
         self.count += 1
@@ -253,7 +259,9 @@ class Edge:
 
     def to_dict(self):
         return {"source": self.src, "target": self.dst, "proto": self.proto,
-                "count": self.count, "writes": self.writes, "exceptions": self.exceptions}
+                "count": self.count, "writes": self.writes, "exceptions": self.exceptions,
+                "first_seen": self.first_seen, "last_seen": self.last_seen,
+                "evidence": self.evidence, "evidence_total": self.evidence_total}
 
 
 def _same24(a: str, b: str) -> bool:
@@ -271,6 +279,28 @@ class Model:
         # gateway-layer crawl stats: (server_id, unit_or_link) -> activity
         self._mb_units: dict[tuple, dict] = {}
         self._dnp_links: dict[tuple, dict] = {}
+        # current packet context for evidence provenance: set per-packet by the
+        # ingestion harness; dissectors record it onto assets/edges
+        self.pkt_ctx: dict = {}
+
+    def _ev(self, obj, detail: str = "", force=False):
+        """Record current packet context as evidence on an asset or edge.
+        Capped: keeps the first and latest few references per object."""
+        if not self.pkt_ctx:
+            return
+        ev = obj.evidence
+        ev_entry = {"source": self.pkt_ctx.get("source", "?")}
+        if self.pkt_ctx.get("frame") is not None:
+            ev_entry["frame"] = self.pkt_ctx["frame"]
+        if self.pkt_ctx.get("ts"):
+            ev_entry["ts"] = self.pkt_ctx["ts"]
+        if detail:
+            ev_entry["detail"] = detail
+        if hasattr(obj, "evidence_total"):
+            obj.evidence_total += 1
+        if len(ev) >= 8 and not force:
+            ev.pop(0)          # keep the most recent
+        ev.append(ev_entry)
 
     # -- logging -----------------------------------------------------------
     def log(self, kind: str, msg: str):
@@ -347,6 +377,7 @@ class Model:
     def bind(self, ip: str, mac: str):
         """Record an ip<->mac association (ARP, DHCP, PN-DCP, Ethernet+IP)."""
         a = self.resolve(ip=ip, mac=mac)
+        self._ev(a, f"bind {ip} <-> {mac}")
         return a
 
     def edge(self, src_id: str, dst_id: str, proto: str) -> Edge:
@@ -364,16 +395,16 @@ class Model:
         with PcapReader(str(path)) as rdr:
             for pkt in rdr:
                 pkts.append(pkt)
-        n = self._ingest_batch(pkts)
+        n = self._ingest_batch(pkts, source=str(path))
         self.log("ingest", f"{path}: {n} packets processed")
         return n
 
-    def ingest_packets(self, pkts) -> int:
-        n = self._ingest_batch(list(pkts))
+    def ingest_packets(self, pkts, source: str = "live") -> int:
+        n = self._ingest_batch(list(pkts), source=source)
         self.log("ingest", f"live batch: {n} packets processed")
         return n
 
-    def _ingest_batch(self, pkts) -> int:
+    def _ingest_batch(self, pkts, source: str = "unknown") -> int:
         """Unified two-pass pipeline used by BOTH pcap and live ingestion:
         pass 1 (identity) is ordered so infrastructure is known before hosts:
           1a. LLDP frames -> router/switch roles + mgmt IPs
@@ -386,14 +417,16 @@ class Model:
         def ts_of(p):
             return datetime.fromtimestamp(float(p.time), tz=timezone.utc).isoformat(timespec="seconds") if p.time else ""
 
-        for pkt in pkts:
+        for i, pkt in enumerate(pkts):
             eth = pkt.getlayer(Ether_cls)
+            self.pkt_ctx = {"source": source, "frame": i + 1, "ts": ts_of(pkt)}
             if eth is not None and eth.type == 0x88CC:
                 try:
                     self._on_lldp(eth.src, bytes(eth.payload), ts_of(pkt))
                 except Exception:
                     continue
-        for pkt in pkts:
+        for i, pkt in enumerate(pkts):
+            self.pkt_ctx = {"source": source, "frame": i + 1, "ts": ts_of(pkt)}
             try:
                 eth = pkt.getlayer(Ether_cls)
                 if pkt.haslayer(ARP_cls):
@@ -402,7 +435,8 @@ class Model:
                     self._on_profinet(eth.src, eth.dst, bytes(eth.payload), ts_of(pkt))
             except Exception:
                 continue
-        for pkt in pkts:
+        for i, pkt in enumerate(pkts):
+            self.pkt_ctx = {"source": source, "frame": i + 1, "ts": ts_of(pkt)}
             try:
                 eth = pkt.getlayer(Ether_cls)
                 if pkt.haslayer(IP_cls) and eth is not None and eth.src not in ("ff:ff:ff:ff:ff:ff", ""):
@@ -412,12 +446,14 @@ class Model:
             except Exception:
                 continue
         # pass 2 (conversations): protocol dissectors build assets + edges
-        for pkt in pkts:
+        for i, pkt in enumerate(pkts):
+            self.pkt_ctx = {"source": source, "frame": i + 1, "ts": ts_of(pkt)}
             try:
                 if self.parse_packet(pkt):
                     n += 1
             except Exception:
                 continue
+        self.pkt_ctx = {}
         self.recompute()
         return n
 
@@ -679,6 +715,7 @@ class Model:
             src = self.resolve(ip=sip)
             src.protocols.add(proto)
             src.touch(ts)
+            self._ev(src, f"{proto} broadcast")
             return None
         s = self.resolve(ip=sip)
         d = self.resolve(ip=dip)
@@ -695,6 +732,9 @@ class Model:
             client, server = s, d
         e = self.edge(client.id, server.id, proto)
         e.touch(ts)
+        self._ev(e, proto)
+        self._ev(client, f"{proto} conversation")
+        self._ev(server, f"{proto} conversation")
         return (client, server, e)
 
     def _on_modbus(self, sip, dip, sp, dp, raw, ts) -> bool:
@@ -1115,6 +1155,7 @@ class Model:
                         "vendor": a.vendor, "mac": a.mac, "ips": sorted(a.ips),
                         "protocols": sorted(a.protocols & OT_PROTOCOLS),
                         "zone": z,
+                        "provenance": a.evidence[:6],
                     },
                     "description": (
                         f"Consumer/vendor-class device ({a.vendor or 'unknown vendor'}) observed in {z}. "
@@ -1140,6 +1181,7 @@ class Model:
                             "protocols": sorted(a.protocols & (OT_PROTOCOLS | IOT_PROTOCOLS)),
                             "attrs": {k: v for k, v in a.attrs.items()
                                       if k in ("model", "upnp_server", "mdns_services", "iot_platform")},
+                            "provenance": a.evidence[:6],
                         },
                         "description": (
                             "Consumer smart-device protocol traffic (mDNS/SSDP/MQTT/KNX/HomeKit) observed "
@@ -1164,7 +1206,8 @@ class Model:
                     "title": f"Enterprise-to-control path: {src.label} -> {dst.label} ({e.proto})",
                     "assets": [e.src, e.dst],
                     "evidence": {"proto": e.proto, "count": e.count,
-                                 "src_zone": sz, "dst_zone": dz},
+                                 "src_zone": sz, "dst_zone": dz,
+                                 "provenance": e.evidence[:6]},
                     "description": (
                         f"Direct {e.proto} session from enterprise zone ({sz}) into control zone ({dz}) "
                         "bypassing the Purdue DMZ segmentation boundary."
@@ -1176,7 +1219,8 @@ class Model:
                     "severity": "info",
                     "title": f"Control writes observed: {src.label} -> {dst.label} ({e.proto}, {e.writes} write requests)",
                     "assets": [e.src, e.dst],
-                    "evidence": {"proto": e.proto, "writes": e.writes},
+                    "evidence": {"proto": e.proto, "writes": e.writes,
+                                 "provenance": e.evidence[:6]},
                     "description": "Write-class function codes observed on the wire (normal for masters, but map and confirm intent).",
                 })
 
@@ -1262,8 +1306,13 @@ class Model:
                  "", "## Findings", ""]
         for f in sorted(self.findings, key=lambda x: {"high": 0, "medium": 1, "info": 2}.get(x["severity"], 3)):
             lines += [f"### [{f['severity'].upper()}] {f['title']}", "",
-                      f["description"], "",
-                      f"- Evidence: `{json.dumps(f['evidence'], default=str)}`", ""]
+                      f["description"], ""]
+            prov = f.get("evidence", {}).get("provenance") or []
+            if prov:
+                cites = ", ".join(f"`{p['source']}#{p.get('frame', '?')}`" for p in prov[:4])
+                lines += [f"- Evidence provenance: {cites}", ""]
+            ev = {k: v for k, v in f.get("evidence", {}).items() if k != "provenance"}
+            lines += [f"- Evidence: `{json.dumps(ev, default=str)}`", ""]
         lines += ["## Assets", "", "| Label | IPs | Vendor | Roles | Zone | Protocols | Unmanaged |",
                   "|---|---|---|---|---|---|---|"]
         for a in sorted(self.assets.values(), key=lambda x: x.id):
@@ -1361,6 +1410,74 @@ class Model:
                 st = self._mb_units.get((gw.id, unit), {}) if proto == "modbus" else {}
                 ce.writes += st.get("writes", 0)
 
+    # -- nmap XML import ---------------------------------------------------------
+    def import_nmap(self, path: str | Path) -> dict:
+        """Fuse an nmap XML export into the model. Imported facts are tagged
+        source='nmap:<file>' and never overwrite passive observations; they
+        enrich assets (hostname, os guess, open ports, service banners) and
+        can add assets not seen passively (marked nmap-only)."""
+        import xml.etree.ElementTree as ET
+        tree = ET.parse(str(path))
+        stats = {"hosts": 0, "added": 0, "enriched": 0}
+        src_tag = f"nmap:{Path(path).name}"
+        for host in tree.iter("host"):
+            addr = host.find("address[@addrtype='ipv4']")
+            if addr is None:
+                continue
+            ip = addr.get("addr")
+            mac_el = host.find("address[@addrtype='mac']")
+            status = host.find("status")
+            if status is not None and status.get("state") == "down":
+                continue
+            a = self.resolve(ip=ip) if mac_el is None else self.bind(ip, mac_el.get("addr"))
+            if a.pkt_count == 0 and not a.evidence:
+                stats["added"] += 1
+            else:
+                stats["enriched"] += 1
+            stats["hosts"] += 1
+            ev = {"source": src_tag}
+            hn = host.find("hostnames/hostname")
+            if hn is not None and hn.get("name"):
+                a.hostnames.add(hn.get("name"))
+                ev["hostname"] = hn.get("name")
+            os_el = host.find("os/osmatch")
+            if os_el is not None:
+                guess = os_el.get("name")
+                if guess:
+                    a.attrs.setdefault("nmap_os", guess)
+                    ev["os"] = guess
+            ports = []
+            for prt in host.iter("port"):
+                state = prt.find("state")
+                if state is None or state.get("state") != "open":
+                    continue
+                portid = int(prt.get("portid"))
+                proto = prt.get("protocol", "tcp")
+                svc = prt.find("service")
+                svc_name = svc.get("name", "") if svc is not None else ""
+                ports.append({"port": portid, "proto": proto, "service": svc_name})
+                if svc is not None:
+                    for attr in ("product", "version"):
+                        v = svc.get(attr)
+                        if v and not a.attrs.get(f"nmap_{attr}"):
+                            a.attrs[f"nmap_{attr}"] = v
+                    if svc.get("name") == "http" and not a.protocols & {"http", "https"}:
+                        a.protocols.add("http")
+            if ports:
+                # merge with any previously imported ports (json round-trip: lists)
+                a.attrs["nmap_open_ports"] = [list(t) for t in sorted(
+                    {(p["port"], p["proto"]) for p in ports} |
+                    {tuple(t) for t in a.attrs.get("nmap_open_ports", [])})]
+                ev["open_ports"] = [p["port"] for p in ports]
+            a.evidence.append(ev)
+            if len(a.evidence) > 12:
+                a.evidence = a.evidence[-12:]
+            a.touch("")
+        self.recompute()
+        self.log("import", f"{src_tag}: {stats['hosts']} hosts "
+                           f"({stats['added']} new, {stats['enriched']} enriched)")
+        return stats
+
     # -- persistence ------------------------------------------------------------
     def save(self, path: str | Path):
         state = {
@@ -1395,6 +1512,7 @@ class Model:
             a.pkt_count = d.get("pkt_count", 0)
             a.first_seen = d.get("first_seen", "")
             a.last_seen = d.get("last_seen", "")
+            a.evidence = list(d.get("evidence", []))
             m.assets[a.id] = a
             for ip in a.ips:
                 m._ip_alias[ip] = a.id
@@ -1408,6 +1526,10 @@ class Model:
             e.count = d.get("count", 0)
             e.writes = d.get("writes", 0)
             e.exceptions = d.get("exceptions", 0)
+            e.first_seen = d.get("first_seen", "")
+            e.last_seen = d.get("last_seen", "")
+            e.evidence = list(d.get("evidence", []))
+            e.evidence_total = d.get("evidence_total", len(e.evidence))
             m.edges[e.key()] = e
         m.findings = state.get("findings", [])
         m.events = state.get("events", [])
@@ -1944,6 +2066,11 @@ def main(argv=None):
     p.add_argument("--format", default="md", choices=["dot", "svg", "png", "csv", "edges.csv", "md", "json"])
     p.add_argument("-o", "--output", default=None)
 
+    p = sub.add_parser("import-nmap", help="fuse an nmap XML export into the model")
+    p.add_argument("xml", nargs="+")
+    p.add_argument("--scope", default=None)
+    p.add_argument("--db", default=str(ROOT / "data" / "state.json"))
+
     p = sub.add_parser("serve", help="launch the web UI")
     p.add_argument("--port", type=int, default=8756)
     p.add_argument("--db", default=str(ROOT / "data" / "state.json"))
@@ -1959,6 +2086,17 @@ def main(argv=None):
             print(f"[+] {pcap}: {n} packets")
         model.save(args.db)
         print(f"[+] {len(model.assets)} assets, {len(model.edges)} conversations, {len(model.findings)} findings -> {args.db}")
+
+    elif args.cmd == "import-nmap":
+        scope = Scope.load(args.scope) if args.scope else Scope()
+        model = Model.load(args.db) if Path(args.db).exists() else Model(scope)
+        model.scope = scope
+        for xml in args.xml:
+            st = model.import_nmap(xml)
+            print(f"[+] {xml}: {st['hosts']} hosts "
+                  f"({st['added']} new, {st['enriched']} enriched)")
+        model.save(args.db)
+        print(f"[+] {len(model.assets)} assets, {len(model.findings)} findings -> {args.db}")
 
     elif args.cmd == "live":
         from scapy.all import AsyncSniffer

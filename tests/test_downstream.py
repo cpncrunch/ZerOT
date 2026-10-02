@@ -664,3 +664,51 @@ def test_s7_szl_probe_against_fixture_plc():
     assert a.attrs.get("s7_module") == "CPU 315-2 PN/DP"
     assert "s7_slave" in a.roles
     assert (a.id, a.id, "s7comm") not in m.edges    # no self-edge artifact
+
+
+def test_evidence_provenance_on_assets_and_findings(model):
+    """Every asset/edge/finding carries pcap file + frame number citations."""
+    lap = model.assets.get("00:1E:C2:AA:05:88")
+    assert lap is not None and lap.evidence, "no evidence recorded on contractor laptop"
+    ev = lap.evidence[0]
+    assert "ot_plant.pcap" in ev["source"] and isinstance(ev.get("frame"), int)
+    # edge evidence: modbus master conversation laptop -> plc
+    e = model.edges[("00:1E:C2:AA:05:88", "00:80:F4:AA:05:12", "modbus")]
+    assert e.evidence and all("frame" in x for x in e.evidence)
+    # findings cite provenance
+    un = next(f0 for f0 in model.findings if f0["id"].startswith("unmanaged-"))
+    assert un["evidence"]["provenance"]
+    # save/load round-trips evidence
+    import tempfile, os
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        p = fh.name
+    model.save(p)
+    m2 = Model.load(p)
+    os.unlink(p)
+    lap2 = m2.assets.get("00:1E:C2:AA:05:88")
+    assert lap2.evidence == lap.evidence
+    e2 = m2.edges[("00:1E:C2:AA:05:88", "00:80:F4:AA:05:12", "modbus")]
+    assert e2.evidence == e.evidence and e2.evidence_total >= e.evidence_total
+
+
+def test_import_nmap_fuses_and_enriches(model):
+    """nmap XML enriches passively-seen assets and adds unseen ones, with
+    source-tagged evidence; down hosts skipped."""
+    st = model.import_nmap("tests/fixtures/nmap_scan.xml")
+    assert st["hosts"] == 2                       # 'down' host skipped
+    scada = by_ip(model)["10.20.7.20"]
+    # enriched: hostname, os guess, product version, open ports
+    assert "scada-srv.packetlabs.local" in scada.hostnames
+    assert scada.attrs["nmap_os"] == "Siemens SIMATIC S7-1500 PLC"
+    assert scada.attrs["nmap_product"] == "1756-L83E ControlLogix"
+    assert [102, 502, 44818] == [p[0] for p in scada.attrs["nmap_open_ports"]]   # sorted
+    # evidence tags the nmap source
+    nmap_ev = [e for e in scada.evidence if e["source"].startswith("nmap:")]
+    assert nmap_ev and sorted(nmap_ev[0]["open_ports"]) == [102, 502, 44818]
+    # unseen host added as nmap-only asset
+    rogue = by_ip(model)["10.20.5.99"]
+    assert "rogue-laptop" in rogue.hostnames
+    assert any(e["source"].startswith("nmap:") for e in rogue.evidence)
+    # passive evidence untouched: modbus edge still cites pcap frames
+    e = model.edges[("00:1E:C2:AA:05:88", "00:80:F4:AA:05:12", "modbus")]
+    assert any("ot_plant.pcap" in x["source"] for x in e.evidence)

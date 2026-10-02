@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<nmaprun scanner="nmap" args="nmap -sV -O -oX" start="1" version="7.94">
+<scaninfo type="connect" protocol="tcp" numservices="1" services="1"/>
+<verbose level="0"/>
+<debugging level="0"/>
+<host starttime="1" endtime="2"><status state="up" reason="syn-ack" reason_ttl="0"/>
+<address addr="10.20.7.20" addrtype="ipv4"/>
+<address addr="00:0C:29:AA:07:20" addrtype="mac"/>
+<hostnames><hostname name="scada-srv.packetlabs.local" type="PTR"/></hostnames>
+<ports><extraports state="closed" count="65533"><extrareasons reason="conn-refused" count="65533"/></extraports>
+<port protocol="tcp" portid="502"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="modbus" method="table" conf="3"/></port>
+<port protocol="tcp" portid="102"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="iso-tsap" method="table" conf="3"/></port>
+<port protocol="tcp" portid="44818"><state state="open" reason="syn-ack" reason_ttl="64"/><service name="enip" product="1756-L83E ControlLogix" version="v35.011" method="probed" conf="10"/></port>
+</ports>
+<os><osmatch name="Siemens SIMATIC S7-1500 PLC" accuracy="88" line="1"/>
+</os>
+<times srtt="1000" rttvar="500" to="100000"/>
+</host>
+<host starttime="1" endtime="2"><status state="up" reason="conn-refused"/>
+<address addr="10.20.5.99" addrtype="ipv4"/>
+<hostnames><hostname name="rogue-laptop" type="PTR"/></hostnames>
+<ports><port protocol="tcp" portid="22"><state state="open" reason="syn-ack"/><service name="ssh" product="OpenSSH" version="9.6p1" method="probed" conf="10"/></port></ports>
+<times srtt="2000" rttvar="1000" to="100000"/>
+</host>
+<host starttime="1" endtime="2"><status state="down" reason="no-response"/>
+<address addr="10.20.9.99" addrtype="ipv4"/>
+</host>
+<runstats><finished time="2" timestr="t" elapsed="1" summary="1"/><hosts up="2" down="1" total="3"/>
+</runstats>
+</nmaprun>
