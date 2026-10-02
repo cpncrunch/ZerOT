@@ -88,6 +88,21 @@ def test_dnp3_link_addresses(model):
     assert rtu.attrs.get("dnp3_link_addr") in (3, 4)
 
 
+def test_iec104_rtu_and_conversation(model):
+    rtu = model.assets.get("74:F6:61:AA:05:33")
+    assert rtu is not None
+    assert "iec104_slave" in rtu.roles
+    assert "rtu" in rtu.roles                      # role inference promotes it
+    assert rtu.vendor == "Schneider Electric Fire & Security Oy"
+    assert rtu.attrs.get("iec104_casdu") == 1
+    scada = by_ip(model)["10.20.7.20"]
+    assert (scada.id, rtu.id, "iec104") in model.edges
+    e = model.edges[(scada.id, rtu.id, "iec104")]
+    assert e.count >= 2 and e.writes == 0          # interrogation only, no commands
+    # scada is also master over iec104
+    assert "master" in scada.roles
+
+
 def test_bacnet_instance(model):
     m = by_ip(model)
     assert m["10.20.5.15"].attrs.get("bacnet_instance") == 102
@@ -513,3 +528,60 @@ def test_cli_active_dryrun(tmp_path):
                        capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stderr
     assert "dry-run" in r.stdout
+
+
+def test_bacnet_whois_probe_against_fixture_device():
+    """Unicast who-is against a local fixture BACnet device: i-am reply must
+    prove the device, capture its instance, and not leave a self-edge."""
+    import socket as sk
+    import threading
+    srv = sk.socket(sk.AF_INET, sk.SOCK_DGRAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.settimeout(3.0)
+    port = srv.getsockname()[1]
+
+    # i-am with device instance 1234, vendor 85 (Johnson Controls)
+    objid = struct.pack(">I", (8 << 22) | 1234)
+    apdu = bytes([0x10, 0x00, 0x0C]) + objid + bytes([0x19, 0x00, 0x29, 0x00]) \
+        + bytes([0x3A]) + struct.pack(">H", 85)
+    iam = bytes([0x81, 0x0B, 0x00, 0x16]) + bytes([0x01, 0x00]) + apdu
+
+    def serve():
+        try:
+            data, addr = srv.recvfrom(2048)
+            assert data[:4] == bytes([0x81, 0x0A, 0x00, 0x08]), "probe sent malformed who-is"
+            srv.sendto(iam, addr)
+        except sk.timeout:
+            pass
+        finally:
+            srv.close()
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    m = Model(Scope(SCOPE))
+    res = ds._probe_bacnet_whois("127.0.0.1", m, port=port, timeout=1.5)
+    t.join(timeout=2.0)
+    assert res is not None, "probe returned None — no i-am parsed"
+    assert res["devices"][0]["instance"] == 1234
+    a = m.resolve(ip="127.0.0.1")
+    assert a.attrs.get("bacnet_instance") == 1234
+    assert a.roles and "bacnet_device" in a.roles
+    assert (a.id, a.id, "bacnet") not in m.edges    # no self-edge artifact
+
+
+def test_iec104_command_direction_counts_write():
+    """A Type-45 (C_SC_NA_1 single-command) request must count as a write."""
+    import scapy.all as sa
+    m = Model(Scope(SCOPE))
+    apci = struct.pack("<I", (0 << 16) | (0 << 1))          # I-format, seq 0/0
+    asdu = struct.pack("<BBH", 45, 1, 1) + bytes([0x01]) + struct.pack("<H", 7)
+    frame = bytes([0x68, 6 + len(asdu)]) + apci + asdu
+    req = (sa.Ether(src="00:0c:29:aa:07:20", dst="74:f6:61:aa:05:33") /
+           sa.IP(src="10.20.7.20", dst="10.20.5.33") /
+           sa.TCP(sport=46001, dport=2404, flags="PA") / sa.Raw(load=frame))
+    ack = (sa.Ether(src="74:f6:61:aa:05:33", dst="00:0c:29:aa:07:20") /
+           sa.IP(src="10.20.5.33", dst="10.20.7.20", ttl=63) /
+           sa.TCP(sport=2404, dport=46001, flags="PA") / sa.Raw(load=frame))
+    m.ingest_packets([req, ack])
+    e = m.edges[("00:0C:29:AA:07:20", "74:F6:61:AA:05:33", "iec104")]
+    assert e.writes == 1

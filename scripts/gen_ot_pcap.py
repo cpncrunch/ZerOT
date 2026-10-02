@@ -28,6 +28,10 @@ fixture, change the tests (and this header) in the same commit.
 
   Switch: 10.20.5.2 00:90:e8:aa:05:02  SW-CTRL-01 (LLDP bridge caps, sysname, mgmt addr)
 
+  Layer crawl: 10.20.5.30 Modbus/TCP gw (units 17+18), 10.20.5.31 routed S7-300,
+               10.20.5.32 DNP3 concentrator (links 3+7),
+               10.20.5.33 74:f6:61 Schneider grid RTU (IEC 60870-5-104, tcp/2404)
+
 EXPECTED ASSERTIONS (tests/test_passive.py):
   assets: >= 12 assets with IP + 1 MAC-only PROFINET asset
   vendor: .11/.16? no — .11 Siemens (OUI 00:0e:8c), .12 Telemecanique, .13 Rockwell,
@@ -214,6 +218,35 @@ def s7_flow_routed(client, server, via="gw", n=1):
                               45000 + i, 102, tpkt_cotp_s7(s7_read(200 + i, 30)), ttl=63))
         out.append(eth_ip_tcp(MAC[via], MAC[client], IPS[server], IPS[client],
                               102, 45000 + i, tpkt_cotp_s7(s7_ack_data(200 + i, 0)), ttl=63))
+    return out
+
+# --- IEC 60870-5-104 -------------------------------------------------------- #
+def iec104_apci(seq_out, seq_ack, ctrl1=None):
+    """APCI I/U-frame: 68 06 ctl1..ctl4. I-format packs the 32-bit control
+    field as (send_seq << 16) | (recv_seq << 1) — ctl1 bit0=0 means I-format."""
+    if ctrl1 is not None:                      # U-frame (STARTDT etc.)
+        ctrl = bytes([ctrl1, 0, 0, 0])
+    else:
+        ctrl = struct.pack("<I", (seq_out << 16) | (seq_ack << 1))
+    return bytes([0x68, 6]) + ctrl
+
+def iec104_i(asdu_type, seq_out, seq_ack, ca=1, ioa=0):
+    """I-frame carrying a minimal ASDU: type(1) vsq=1 sq=0(1) ca(2) cause(1) ioa(2)."""
+    asdu = struct.pack("<BBH", asdu_type, 1, ca) + bytes([0]) + struct.pack("<H", ioa)
+    return iec104_apci(seq_out, seq_ack) + asdu
+
+def iec104_flow(master, rtu, n=2):
+    """STARTDT, interrogation (Type 100), single-point monitors (Type 1)."""
+    out = []
+    out.append(eth_ip_tcp(MAC[master], MAC[rtu], IPS[master], IPS[rtu],
+                          46000, 2404, iec104_apci(0, 0, ctrl1=0x07)))   # STARTDT act
+    out.append(eth_ip_tcp(MAC[rtu], MAC[master], IPS[rtu], IPS[master],
+                          2404, 46000, iec104_apci(0, 0, ctrl1=0x0B)))   # STARTDT con
+    out.append(eth_ip_tcp(MAC[master], MAC[rtu], IPS[master], IPS[rtu],
+                          46000, 2404, iec104_i(100, 0, 0)))             # C_IC_NA_1
+    for i in range(n):
+        out.append(eth_ip_tcp(MAC[rtu], MAC[master], IPS[rtu], IPS[master],
+                              2404, 46000, iec104_i(1, 2 + 2 * i, 2 + 2 * i, ioa=100 + i)))
     return out
 
 # --- BACnet ----------------------------------------------------------------- #
@@ -406,11 +439,13 @@ IPS = {
     "laptop": "10.20.5.88", "scada": "10.20.7.20", "hist": "10.20.7.21",
     "gw": "10.20.7.1", "ews": "10.20.9.30", "sw": "10.20.5.2",
     "mb_gw": "10.20.5.30", "remote_plc": "10.20.5.31", "dnpc": "10.20.5.32",
+    "rtu104": "10.20.5.33",
 }
 
 MAC["mb_gw"] = "00:90:e8:aa:05:30"     # MOXA Modbus/TCP gateway
 MAC["remote_plc"] = "00:0e:8c:aa:05:31"  # Siemens S7-300 slave behind gw
 MAC["dnpc"] = "00:0b:ab:aa:05:32"      # Advantech DNP3 data concentrator
+MAC["rtu104"] = "74:f6:61:aa:05:33"    # Schneider Electric (grid RTU, IEC-104)
 # consumer/BAS devices (real OUIs from data/oui.txt)
 MAC["esp_therm"] = "d4:8a:fc:aa:05:60"   # Espressif Inc. (ESPHome-style thermostat)
 IPS["esp_therm"] = "10.20.5.60"
@@ -440,6 +475,8 @@ def build():
     out += dnp3_link_flow("scada", "dnpc", own_link=3, remote_link=7)
     # C) routed remote PLC: S7 through the MOXA router (TTL decremented)
     out += s7_flow_routed("scada", "remote_plc", via="gw")
+    # D) IEC 60870-5-104: grid master interrogates a substation RTU (tcp/2404)
+    out += iec104_flow("scada", "rtu104")
 
     # --- smart-building / IoT devices ---
     # Espressif thermostat: mDNS PTR/SRV/TXT/A announce (HomeKit-style)

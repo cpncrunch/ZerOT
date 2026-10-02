@@ -144,12 +144,14 @@ class Scope:
 # Model
 # --------------------------------------------------------------------------
 
-OT_PROTOCOLS = {"modbus", "s7comm", "enip", "dnp3", "opcua", "bacnet", "profinet_dcp", "profinet_rt"}
+OT_PROTOCOLS = {"modbus", "s7comm", "enip", "dnp3", "iec104", "opcua", "bacnet", "profinet_dcp", "profinet_rt"}
 IOT_PROTOCOLS = {"mdns", "ssdp", "mqtt", "knxnet_ip"}
 IOT_ROLES = {"iot_device", "mqtt_client", "knx_client", "mdns_querier"}
 OT_ZONES = {"L1", "L2", "L3", "L2_L3"}
 
 MODBUS_WRITE_FCS = {5, 6, 15, 16}
+# IEC 60870-5-104 TypeIDs that issue commands (control direction)
+IEC104_WRITE_TYPES = {45, 46, 47, 48, 49, 50, 51, 58, 59, 60, 61, 62, 63, 64}
 
 class Asset:
     def __init__(self, mac: str = "", ip: str = ""):
@@ -492,6 +494,8 @@ class Model:
                 return self._on_enip(sip, dip, sp, dp, raw, ts)
             if dp == 20000 or sp == 20000:
                 return self._on_dnp3(sip, dip, sp, dp, raw, ts)
+            if dp == 2404 or sp == 2404:
+                return self._on_iec104(sip, dip, sp, dp, raw, ts)
             if dp == 4840 or sp == 4840:
                 return self._on_opcua(sip, dip, sp, dp, raw, ts)
             return False
@@ -785,6 +789,30 @@ class Model:
         server.roles.add("dnp3_outstation")
         return True
 
+    def _on_iec104(self, sip, dip, sp, dp, raw, ts) -> bool:
+        if len(raw) < 6 or raw[0] != 0x68:
+            return False
+        r = self._conv(sip, dip, "iec104", ts, server_port=2404, sport=sp, dport=dp)
+        if r is None:
+            return True
+        client, server, e = r
+        client.roles.add("master")
+        server.roles.add("iec104_slave")
+        # control func: I-format frame (ctrl1 bit0=0)
+        if (raw[2] & 0x01) == 0 and len(raw) >= 10:
+            try:
+                # ASDU starts right after the 6-byte APCI: type(1) vsq(1) ca(2)
+                type_id, vsq, ca = struct.unpack("<BBH", raw[6:10])
+                if dp == 2404:
+                    if type_id in IEC104_WRITE_TYPES:
+                        e.writes += 1
+                    elif type_id in (100, 101):     # interrogation / counter
+                        client.attrs["iec104_casdu"] = ca
+                server.attrs.setdefault("iec104_casdu", ca)
+            except struct.error:
+                pass
+        return True
+
     def _on_opcua(self, sip, dip, sp, dp, raw, ts) -> bool:
         if len(raw) < 8 or raw[0:4] not in (b"HELF", b"OPNF", b"MSGF", b"ERRF", b"CLOF"):
             return False
@@ -1056,7 +1084,7 @@ class Model:
         for a in self.assets.values():
             if "modbus_slave" in a.roles or "s7_slave" in a.roles or "enip_slave" in a.roles:
                 a.roles.add("plc")
-            if "dnp3_outstation" in a.roles:
+            if "dnp3_outstation" in a.roles or "iec104_slave" in a.roles:
                 a.roles.add("rtu")
             z = a.zone(sc)
             if "master" in a.roles:
@@ -1395,7 +1423,7 @@ class Model:
 
 # Registry: ONLY read-only discovery techniques exist. Write-class probes are
 # deliberately not implemented; requesting an unknown technique is a hard block.
-ACTIVE_TECHNIQUES = {"arp_ping", "tcp_probe", "modbus_id", "enip_list", "mdns_query", "ssdp_msearch", "modbus_unit_sweep"}
+ACTIVE_TECHNIQUES = {"arp_ping", "tcp_probe", "modbus_id", "enip_list", "mdns_query", "ssdp_msearch", "modbus_unit_sweep", "bacnet_whois"}
 
 
 class ActivePlanner:
@@ -1569,8 +1597,10 @@ def _probe_enip_list(ip: str, model: Model, port: int = 44818):
     a.protocols.add("enip")
     a.roles.add("enip_slave")
     a.touch(now_iso())
-    # reuse the passive dissector on the response bytes
+    # reuse the passive dissector on the response bytes; drop the self-edge
+    # the sip==dip fold creates (probe artifact, not a real conversation)
     model._on_enip(ip, ip, port, 44818, resp, now_iso())
+    model.edges.pop((a.id, a.id, "enip"), None)
     return {"ip": ip, "product": a.attrs.get("enip_product", "?")}
 
 
@@ -1612,10 +1642,42 @@ def _probe_ssdp(ip: str, model: Model):
     return {"ip": ip, "upnp_server": a.attrs.get("upnp_server", "?")}
 
 
+def _probe_bacnet_whois(ip: str, model: Model, port: int = 47808, timeout: float = 1.5):
+    """Unicast BACnet who-is to a specific device: any i-am reply proves a live
+    BACnet device and its device-instance. Read-only."""
+    # BVLC unicast(0x0A) + NPDU(2) + APDU who-is(2)
+    whois = bytes([0x81, 0x0A, 0x00, 0x08]) + bytes([0x01, 0x00]) + bytes([0x10, 0x08])
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    found = []
+    try:
+        s.sendto(whois, (ip, port))
+        while True:
+            try:
+                data, addr = s.recvfrom(2048)
+            except socket.timeout:
+                break
+            if len(data) < 10 or data[0] != 0x81:
+                continue
+            model._on_bacnet(addr[0], ip, addr[1], port, data, now_iso())
+            a = model.resolve(ip=addr[0])
+            model.edges.pop((a.id, a.id, "bacnet"), None)   # probe artifact
+            inst = a.attrs.get("bacnet_instance")
+            found.append({"ip": addr[0], "instance": inst, "vendor": a.vendor})
+    except OSError:
+        pass
+    finally:
+        s.close()
+    if not found:
+        return None
+    return {"ip": ip, "devices": found}
+
+
 _ACTIVE_RUNNERS = {"arp_ping": _probe_arp, "tcp_probe": _probe_tcp,
                    "modbus_id": _probe_modbus_id, "enip_list": _probe_enip_list,
                    "mdns_query": _probe_mdns, "ssdp_msearch": _probe_ssdp,
-                   "modbus_unit_sweep": _probe_modbus_unit_sweep}
+                   "modbus_unit_sweep": _probe_modbus_unit_sweep,
+                   "bacnet_whois": _probe_bacnet_whois}
 
 # --------------------------------------------------------------------------
 # Flask app
