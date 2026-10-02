@@ -218,6 +218,66 @@ def test_attack_paths_traverse_layers(model):
     assert (gw.id, child.id, "modbus_bridge") in model.edges
 
 
+# ---- smart-building / IoT devices ------------------------------------------- #
+
+def test_mdns_thermostat(model):
+    m = by_ip(model)
+    th = m["10.20.5.60"]
+    assert "iot_device" in th.roles
+    assert "Downstream Thermostat" in th.hostnames
+    assert any("_hap._tcp" in s for s in th.attrs.get("mdns_services", []))
+    assert th.attrs.get("iot_platform") == "HomeKit"
+    assert th.attrs.get("model") == "Downstream"
+    assert th.vendor == "Espressif Inc."
+    assert th.zone(model.scope) == "L1"          # it's on the control subnet
+
+
+def test_ssdp_thermostat(model):
+    m = by_ip(model)
+    th = m["10.20.5.61"]
+    assert "iot_device" in th.roles
+    assert th.vendor.startswith("Honeywell")
+    assert th.attrs.get("upnp_server") == "Honeywell TH-IP UPnP/1.0"
+    assert "uuid:downstream-Honeywell-TH-IP" in th.attrs.get("upnp_usn", "")
+
+
+def test_mqtt_client_and_broker(model):
+    m = by_ip(model)
+    th = m["10.20.5.60"]
+    assert "mqtt_client" in th.roles
+    assert th.attrs.get("mqtt_client_id") == "home-svc/thermostat-lr"
+    assert "home/livingroom/temp" in th.attrs.get("mqtt_topics", [])
+    scada = m["10.20.7.20"]
+    assert "mqtt_broker" in scada.roles
+    ids = {ip: a.id for a in model.assets.values() for ip in a.ips}
+    assert (ids["10.20.5.60"], ids["10.20.7.20"], "mqtt") in model.edges
+
+
+def test_knx(model):
+    m = by_ip(model)
+    gw = m["10.20.5.63"]
+    assert "knx_gateway" in gw.roles
+    assert "knxgw" in gw.hostnames
+    hub = m["10.20.5.62"]
+    assert "knx_client" in hub.roles
+    assert hub.vendor == "Google, Inc."
+
+
+def test_iot_ot_findings(model):
+    iot_findings = [f for f in model.findings if f["id"].startswith("iot-ot-")]
+    assert len(iot_findings) >= 2               # esp thermostat + honeywell + knx devices
+    sev = {f["severity"] for f in iot_findings}
+    assert sev == {"medium"}
+    # evidence carries the useful enrichment
+    esp = [f for f in iot_findings if "10.20.5.60" in f["evidence"].get("ips", [])]
+    assert esp and "Espressif Inc." == esp[0]["evidence"]["vendor"]
+
+
+def test_mdns_querier_role(model):
+    m = by_ip(model)
+    assert "mdns_querier" in m["10.20.5.62"].roles
+
+
 # ---- scope / active gating -------------------------------------------------- #
 
 def test_scope_zone_resolution():

@@ -62,7 +62,8 @@ OUI = load_oui()
 
 CONSUMER_VENDOR_PREFIXES = (
     "Apple", "Dell", "Lenovo", "ASUSTek", "Gigabyte", "Micro-Star", "MSI",
-    "Samsung", "Xiaomi",
+    "Samsung", "Xiaomi", "Espressif", "Google", "ecobee", "Nest Labs",
+    "Shenzhen", "TP-Link", "Ring", "Amazon Technologies", "Roku", "Sonos",
 )
 
 def mac_vendor(mac: str) -> str:
@@ -144,6 +145,9 @@ class Scope:
 # --------------------------------------------------------------------------
 
 OT_PROTOCOLS = {"modbus", "s7comm", "enip", "dnp3", "opcua", "bacnet", "profinet_dcp", "profinet_rt"}
+IOT_PROTOCOLS = {"mdns", "ssdp", "mqtt", "knxnet_ip"}
+IOT_ROLES = {"iot_device", "mqtt_client", "knx_client", "mdns_querier"}
+OT_ZONES = {"L1", "L2", "L3", "L2_L3"}
 
 MODBUS_WRITE_FCS = {5, 6, 15, 16}
 
@@ -478,6 +482,8 @@ class Model:
             if not raw:
                 return False
             sp, dp = tcp.sport, tcp.dport
+            if dp == 1883 or sp == 1883:
+                return self._on_mqtt(sip, dip, sp, dp, raw, ts)
             if dp == 502 or sp == 502:
                 return self._on_modbus(sip, dip, sp, dp, raw, ts)
             if dp == 102 or sp == 102:
@@ -499,9 +505,167 @@ class Model:
                 return self._on_nbns(sip, raw, ts)
             if dp == 67 or dp == 68 or sp == 67 or sp == 68:
                 return self._on_dhcp(src_mac, raw, ts)
+            if dp == 5353 or sp == 5353:
+                return self._on_mdns(sip, raw, ts)
+            if dp == 1900 or sp == 1900:
+                return self._on_ssdp(sip, raw, ts)
+            if dp == 3671 or sp == 3671:
+                return self._on_knx(sip, raw, ts)
         return False
 
     # -- dissectors ------------------------------------------------------------
+
+    # --- smart-building / IoT -------------------------------------------------
+    def _read_dns_name(self, raw: bytes, off: int) -> tuple[str, int]:
+        """Decode a (non-compressed) DNS name; returns (name, next_offset)."""
+        labels = []
+        while off < len(raw):
+            ln = raw[off]
+            off += 1
+            if ln == 0:
+                break
+            labels.append(raw[off:off + ln].decode("utf-8", "replace"))
+            off += ln
+        return ".".join(labels), off
+
+    def _on_mdns(self, sip: str, raw: bytes, ts: str) -> bool:
+        if len(raw) < 12:
+            return False
+        try:
+            qr = (raw[2] >> 7) & 1
+            qd, an = struct.unpack(">H", raw[4:6])[0], struct.unpack(">H", raw[6:8])[0]
+            ns, ar = struct.unpack(">H", raw[8:10])[0], struct.unpack(">H", raw[10:12])[0]
+        except struct.error:
+            return False
+        a = self.resolve(ip=sip)
+        a.protocols.add("mdns")
+        a.touch(ts)
+        if qr == 0:
+            a.roles.add("mdns_querier")
+        # walk all records (answer/authority/additional)
+        off = 12
+        for _ in range(qd):
+            _, off = self._read_dns_name(raw, off)
+            off += 4
+        for _ in range(an + ns + ar):
+            if off + 10 > len(raw):
+                break
+            name, off = self._read_dns_name(raw, off)
+            rtype, rclass, ttl, rdlen = struct.unpack(">HHIH", raw[off:off + 10])
+            off += 10
+            rdata = raw[off:off + rdlen]
+            off += rdlen
+            if rtype == 12 and name.endswith(".local"):
+                # PTR: instance is in the record NAME (Instance._svc._tcp.local),
+                # rdata points at the service type.
+                inst = name.split(".")[0]
+                svc = name.split(".", 1)[1] if "." in name else ""
+                if inst and svc:
+                    a.hostnames.add(inst)
+                    a.attrs.setdefault("mdns_services", [])
+                    if svc not in a.attrs["mdns_services"]:
+                        a.attrs["mdns_services"].append(svc)
+                a.roles.add("iot_device")
+                if "hap" in name:
+                    a.attrs["iot_platform"] = "HomeKit"
+            elif rtype == 33:  # SRV
+                a.roles.add("iot_device")
+            elif rtype == 16:  # TXT: one or more length-prefixed strings
+                i2 = 0
+                while i2 < len(rdata):
+                    sl = rdata[i2]
+                    i2 += 1
+                    s = rdata[i2:i2 + sl].decode("utf-8", "replace")
+                    i2 += sl
+                    if s.startswith("md="):
+                        a.attrs["model"] = s[3:]
+                    elif s.startswith("id="):
+                        a.attrs["device_id"] = s[3:]
+        return True
+
+    def _on_ssdp(self, sip: str, raw: bytes, ts: str) -> bool:
+        try:
+            head = raw[:600].decode("utf-8", "replace")
+        except Exception:
+            return False
+        if "HTTP/1.1" not in head.split("\r\n")[0] and "HTTP/1.0" not in head.split("\r\n")[0]:
+            return False
+        a = self.resolve(ip=sip)
+        a.protocols.add("ssdp")
+        a.touch(ts)
+        a.roles.add("iot_device")
+        for line in head.split("\r\n"):
+            if line.lower().startswith("server:"):
+                a.attrs["upnp_server"] = line.split(":", 1)[1].strip()
+            elif line.lower().startswith("usn:"):
+                a.attrs["upnp_usn"] = line.split(":", 1)[1].strip()
+            elif line.lower().startswith("nt:"):
+                a.attrs["upnp_nt"] = line.split(":", 1)[1].strip()
+            elif line.lower().startswith("st:") and "ssdp:discover" not in line:
+                a.attrs["upnp_st"] = line.split(":", 1)[1].strip()
+        return True
+
+    def _on_mqtt(self, sip, dip, sp, dp, raw, ts) -> bool:
+        if not raw:
+            return False
+        ptype = raw[0] >> 4
+        r = self._conv(sip, dip, "mqtt", ts, server_port=1883, sport=sp, dport=dp)
+        if r is None:
+            return True
+        client, server, e = r
+        client.roles.add("mqtt_client")
+        server.roles.add("mqtt_broker")
+        if ptype == 1:  # CONNECT: client-id in payload
+            try:
+                # fixed hdr(1) + remaining len (assume <128) + proto name len(2)
+                i = 2
+                namelen = struct.unpack(">H", raw[i:i + 2])[0]
+                i += 2 + namelen + 4          # name, level, flags, keepalive
+                cidlen = struct.unpack(">H", raw[i:i + 2])[0]
+                cid = raw[i + 2:i + 2 + cidlen].decode("utf-8", "replace")
+                if cid:
+                    client.attrs["mqtt_client_id"] = cid
+                    client.hostnames.add(cid)
+            except (struct.error, IndexError):
+                pass
+        elif ptype == 3:  # PUBLISH: topic name after remaining-length byte
+            try:
+                tlen = struct.unpack(">H", raw[2:4])[0]
+                topic = raw[4:4 + tlen].decode("utf-8", "replace")
+                if topic:
+                    client.attrs.setdefault("mqtt_topics", [])
+                    if topic not in client.attrs["mqtt_topics"]:
+                        client.attrs["mqtt_topics"].append(topic)
+            except (struct.error, IndexError):
+                pass
+        return True
+
+    def _on_knx(self, sip: str, raw: bytes, ts: str) -> bool:
+        if len(raw) < 6 or raw[0] != 6 or raw[1] != 0x10:
+            return False
+        svc = struct.unpack(">H", raw[2:4])[0]
+        a = self.resolve(ip=sip)
+        a.protocols.add("knxnet_ip")
+        a.touch(ts)
+        if svc == 0x0201:
+            a.roles.add("knx_client")
+        elif svc == 0x0202:
+            a.roles.add("knx_gateway")
+            # walk DIBs for device name
+            off = 6 + 8  # header + HPAI
+            while off + 2 <= len(raw):
+                dlen, dtype = raw[off], raw[off + 1]
+                if dlen < 2:
+                    break
+                if dtype == 0x02 and dlen > 6:
+                    # friendly-name DIB: name follows medium/status/address
+                    nm = raw[off + 6:off + dlen].split(b"\x00")[0].decode("utf-8", "replace")
+                    if nm and nm.isprintable():
+                        a.hostnames.add(nm)
+                        a.attrs["knx_friendly_name"] = nm
+                off += dlen
+        return True
+
     def _conv(self, sip: str, dip: str, proto: str, ts="", server_port: int | None = None,
               sport: int = 0, dport: int = 0):
         """Resolve client & server assets for a conversation frame. Returns
@@ -931,6 +1095,31 @@ class Model:
                            "Presence in the control zone suggests an unmanaged engineering or contractor asset.")
                     ),
                 })
+            # IoT/smart-building devices in an OT zone (or talking to one)
+            if a.roles & IOT_ROLES:
+                talks_to_control = any(
+                    e.src == a.id and self.assets.get(e.dst) is not None
+                    and self.assets[e.dst].zone(sc) in OT_ZONES
+                    for e in self.edges.values()) or z in OT_ZONES
+                if talks_to_control:
+                    f.append({
+                        "id": f"iot-ot-{a.id}",
+                        "severity": "medium",
+                        "title": f"IoT/smart-building device on OT network: {a.label} ({a.vendor or '?'})",
+                        "assets": [a.id],
+                        "evidence": {
+                            "vendor": a.vendor, "mac": a.mac, "ips": sorted(a.ips),
+                            "protocols": sorted(a.protocols & (OT_PROTOCOLS | IOT_PROTOCOLS)),
+                            "attrs": {k: v for k, v in a.attrs.items()
+                                      if k in ("model", "upnp_server", "mdns_services", "iot_platform")},
+                        },
+                        "description": (
+                            "Consumer smart-device protocol traffic (mDNS/SSDP/MQTT/KNX/HomeKit) observed "
+                            + (f"inside {z} — " if z in OT_ZONES else "communicating with the OT network — ")
+                            + "a thermostat/hub/sensor bridged onto the control network is a common "
+                              "flat-network finding and a wireless-to-OT pivot path."
+                        ),
+                    })
 
         for e in self.edges.values():
             if e.proto not in OT_PROTOCOLS:
@@ -1206,7 +1395,7 @@ class Model:
 
 # Registry: ONLY read-only discovery techniques exist. Write-class probes are
 # deliberately not implemented; requesting an unknown technique is a hard block.
-ACTIVE_TECHNIQUES = {"arp_ping", "tcp_probe", "modbus_id", "enip_list"}
+ACTIVE_TECHNIQUES = {"arp_ping", "tcp_probe", "modbus_id", "enip_list", "mdns_query", "ssdp_msearch"}
 
 
 class ActivePlanner:
@@ -1353,7 +1542,7 @@ def _probe_enip_list(ip: str, model: Model, port: int = 44818):
     s.settimeout(2.0)
     try:
         s.connect((ip, port))
-        req = struct.pack("<HHIQ8sI", 0x63, 0, 0, 0, b"dstrmk01", 0)
+        req = struct.pack("<HHII8sI", 0x63, 0, 0, 0, b"dstrmk01", 0)
         s.send(req)
         resp = s.recv(512)
     finally:
@@ -1369,8 +1558,47 @@ def _probe_enip_list(ip: str, model: Model, port: int = 44818):
     return {"ip": ip, "product": a.attrs.get("enip_product", "?")}
 
 
+def _probe_mdns(ip: str, model: Model):
+    """One-shot multicast mDNS service enumeration (_services._dns-sd)."""
+    import scapy.all as sa
+    sa.conf.verb = 0
+    dns = sa.DNS(id=0, rd=1, qdcount=1, qd=sa.DNSQR(qname=b"_services._dns-sd._udp.local", qtype=12))
+    pkt = (sa.IP(dst="224.0.0.251") / sa.UDP(sport=5353, dport=5353) / dns)
+    try:
+        resp = sa.sr1(pkt, timeout=2.0, verbose=0)
+    except Exception:
+        resp = None
+    a = model.resolve(ip=ip)
+    a.protocols.add("mdns")
+    a.touch(now_iso())
+    if resp is not None and resp.haslayer(sa.UDP):
+        model._on_mdns(ip, bytes(resp[sa.UDP].payload), now_iso())
+        return {"ip": ip, "services": a.attrs.get("mdns_services", [])}
+    return {"ip": ip, "result": "no mDNS response"}
+
+
+def _probe_ssdp(ip: str, model: Model):
+    """One-shot unicast SSDP M-SEARCH to a specific device."""
+    msearch = ("M-SEARCH * HTTP/1.1\r\nHOST: {}:1900\r\nMAN: \"ssdp:discover\"\r\n"
+               "MX: 2\r\nST: upnp:rootdevice\r\n\r\n").format(ip)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(2.0)
+    try:
+        s.sendto(msearch.encode(), (ip, 1900))
+        data, _ = s.recvfrom(2048)
+    except (socket.timeout, OSError):
+        return None
+    finally:
+        s.close()
+    a = model.resolve(ip=ip)
+    a.touch(now_iso())
+    model._on_ssdp(ip, data, now_iso())
+    return {"ip": ip, "upnp_server": a.attrs.get("upnp_server", "?")}
+
+
 _ACTIVE_RUNNERS = {"arp_ping": _probe_arp, "tcp_probe": _probe_tcp,
-                   "modbus_id": _probe_modbus_id, "enip_list": _probe_enip_list}
+                   "modbus_id": _probe_modbus_id, "enip_list": _probe_enip_list,
+                   "mdns_query": _probe_mdns, "ssdp_msearch": _probe_ssdp}
 
 # --------------------------------------------------------------------------
 # Flask app
@@ -1609,7 +1837,8 @@ def main(argv=None):
             # execute: probe each target with the gated read-only techniques
             plan = []
             for t in targets:
-                for tech in ("arp_ping", "tcp_probe", "modbus_id", "enip_list"):
+                for tech in ("arp_ping", "tcp_probe", "modbus_id", "enip_list",
+                             "mdns_query", "ssdp_msearch"):
                     plan.append({"technique": tech, "ip": t["ip"], "decision":
                                  scope.active_decision(tech)})
             res = run_active(model, plan, execute=True, assume_yes=args.yes)

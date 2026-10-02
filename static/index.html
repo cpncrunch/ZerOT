@@ -135,7 +135,7 @@
 const ZONE_COLORS = {L1:"#8b6f47", L2_L3:"#4a7a8c", L2:"#4a7a8c", L3:"#4a7a8c",
                      Enterprise:"#7a4a8c", DMZ:"#3d6b4f", Unclassified:"#57606a", Excluded:"#444"};
 const ROLE_SHAPES = {plc:"rect", rtu:"rect", switch:"hexagon", gateway:"diamond",
-                     scada_server:"cylinder", engineering_ws:"house"};
+                     scada_server:"cylinder", engineering_ws:"house", iot_device:"cross"};
 const d3svg = d3.select("svg");
 let G = {nodes: [], links: [], findings: []};
 let selected = null, sim = null, pathsCache = [];
@@ -297,6 +297,7 @@ function shapePath(shape, r) {
     case "diamond": return `M0,${-r*1.1}L${r*.9},0L0,${r*1.1}L${-r*.9},0z`;
     case "cylinder": return `M${-r*.8},${-r*.7}a${r*.8},${r*.3} 0 0 0 ${1.6*r},0v${1.25*r}a${r*.8},${r*.3} 0 0 1 ${-1.6*r},0z`;
     case "house": return `M0,${-r}L${r*.95},${-r*.15}v${r}h${-1.9*r}v${-r}z`;
+    case "cross": { const t = r * .32; return `M${-t},${-r}h${2*t}v${r-t*2}h${r-t*2}v${2*t}h${-r+t*2}v${r-t*2}h${-2*t}v${-r+t*2}h${-r+t*2}v${-2*t}h${r+t*2}z`; }
     default: return d3.symbol(d3.symbolCircle, 15 * 15)();
   }
 }

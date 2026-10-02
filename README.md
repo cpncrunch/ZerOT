@@ -13,8 +13,9 @@ air-gap capable (d3 vendored, OUI database bundled, zero external calls).
 | Layer | Source | Output |
 |---|---|---|
 | Devices | Ethernet/ARP/DHCP/LLDP/NBNS/PN-DCP | assets with MAC↔IP, vendor (IEEE OUI), hostnames |
-| Conversations | Modbus, S7comm, EtherNet/IP, DNP3, OPC UA, BACnet, PROFINET RT | directed master→slave edges, write counts, exception counts |
+| Conversations | Modbus, S7comm, EtherNet/IP, DNP3, OPC UA, BACnet, PROFINET RT, MQTT | directed master→slave / client→broker edges, write counts, exception counts |
 | Products | CIP Identity (listIdentity), PN-DCP, DHCP | product names ("1756-L83E"), station names |
+| **Smart building / IoT** | mDNS (HomeKit/ESPHome-style PTR/SRV/TXT/A), SSDP (UPnP M-SEARCH/NOTIFY), MQTT (client-ids, topics), KNXnet/IP (search, gateway names), BACnet | thermostats, hubs, sensors as `iot_device` assets with model/platform attrs; `IoT device on OT network` findings |
 | **Hidden layers** | Modbus unit IDs (>1 unit = gateway; each unit = child PLC) | virtual child assets + bridge edges |
 | **Hidden layers** | DNP3 link addresses (>1 dst = data concentrator; each link = child RTU) | virtual child assets + bridge edges |
 | **Hidden layers** | IP TTL (initial-guess 64/128/255) | `inferred_hops`, `last_hop_router` on routed assets |
@@ -91,7 +92,8 @@ the previous round learned. It stops when no new targets appear.
 - `block`   — never runs (also: active disabled ⇒ everything blocked)
 
 **Write-class probes do not exist in this tool.** The technique registry is a
-closed set of read-only discovery methods; unknown technique names are hard
+closed set of read-only discovery methods (`arp_ping`, `tcp_probe`, `modbus_id`,
+`enip_list`, `mdns_query`, `ssdp_msearch`); unknown technique names are hard
 blocked at execution time.
 
 ## API (serve mode)
@@ -112,9 +114,10 @@ blocked at execution time.
 python3 -m pytest tests/ -q
 ```
 
-31 tests over the synthetic known-answer fixture: vendors, roles, edges,
+37 tests over the synthetic known-answer fixture: vendors, roles, edges,
 gateway/concentrator virtual children, router-guard, TTL hop inference, attack
-paths, active gating (dry-run, unknown-technique block, confirm-requires-yes),
+paths, smart-building/IoT devices (mDNS/SSDP/MQTT/KNX), IoT-on-OT findings,
+active gating (dry-run, unknown-technique block, confirm-requires-yes),
 exports, save/load roundtrip, CLI smoke.
 
 ## Safety posture

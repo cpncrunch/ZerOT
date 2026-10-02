@@ -332,6 +332,67 @@ def dhcp_discover(hostname):
     opt55 = bytes([55, 2, 1, 15])
     return msg + b"\x63\x82\x53\x63" + opt53 + opt12 + opt55 + b"\xff"
 
+# --- mDNS / SSDP / MQTT / KNX ------------------------------------------------ #
+def mdns_ptr_response(instance="Downstream Thermostat", svc="_hap._tcp", ip="10.20.5.60"):
+    """PTR answer + SRV + TXT + A records for a HomeKit-style announce."""
+    def name(n):  # dotted dns name -> label encoding (splits on '.')
+        out = b""
+        for label in n.split("."):
+            out += bytes([len(label)]) + label.encode()
+        return out + b"\x00"
+    def rr(rname, rtype, ttl, rdata):
+        return rname + struct.pack(">HHIH", rtype, 1, ttl, len(rdata)) + rdata
+    qname = svc + ".local"
+    inst_q = name(instance + "." + svc + ".local")
+    svc_q = name(svc + ".local")
+    host_q = name(instance + ".local")
+    answers = rr(inst_q, 12, 120, svc_q)                       # PTR
+    authority = rr(svc_q, 33, 120, name(instance) + struct.pack(">HIII", 8080, 0, 0, 8080))  # SRV
+    additional = rr(svc_q, 16, 120, name("md=Downstream") + name("pv=1.0"))  # TXT
+    additional += rr(host_q, 1, 120, bytes(int(o) for o in ip.split(".")))  # A
+    hdr = struct.pack(">HHHHHH", 0x0000, 0x8400, 0, 1, 1, 2)   # id=0, flags=response
+    return hdr + answers + authority + additional
+
+def mdns_query(svc="_services._dns-sd._udp"):
+    def name(n):
+        return bytes([len(n)]) + n.encode() + b"\x00"
+    q = name("_services") + name("_dns-sd") + name("_udp") + name("local")
+    return struct.pack(">HHHHHH", 0x0000, 0x0100, 1, 0, 0, 0) + q + struct.pack(">HH", 12, 1)
+
+def ssdp_msearch_alive(product="Honeywell TH-IP", ip="10.20.5.61"):
+    msearch = (b"M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+               b"MAN: \"ssdp:discover\"\r\nMX: 2\r\nST: upnp:rootdevice\r\n\r\n")
+    alive = (b"NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+             b"NT: upnp:rootdevice\r\nNTS: ssdp:alive\r\nUSN: uuid:downstream-"
+             + product.replace(" ", "-").encode() + b"\r\nSERVER: " + product.encode()
+             + b" UPnP/1.0\r\nLOCATION: http://" + ip.encode() + b"/desc.xml\r\n\r\n")
+    return msearch, alive
+
+def mqtt_connect_pub(client_id="home-svc/thermostat-lr", topic="home/livingroom/temp"):
+    # MQTT 3.1.1 CONNECT (protocol name/level 4, clean session, keepalive 60)
+    def field(b):
+        return struct.pack(">H", len(b)) + b
+    vh = field(b"MQTT") + bytes([4, 2]) + struct.pack(">H", 60)
+    payload = field(client_id.encode())
+    body = vh + payload
+    connect = bytes([0x10]) + bytes([len(body)]) + body
+    # PUBLISH QoS0: fixed hdr(1) + remaining len(1) + topic len(2) + topic + payload
+    tp = topic.encode() + b"22.5"
+    pub = bytes([0x30, len(tp) + 2]) + struct.pack(">H", len(topic)) + tp
+    return connect, pub
+
+def knx_search_req_resp():
+    """KNXnet/IP SEARCH_REQUEST (multicast 224.0.23.12:3671) + SEARCH_RESPONSE.
+    Header: hdrlen=6, ver=0x10, service(2), total_len(2). Body: HPAI / DIBs."""
+    hpai = bytes([8, 0x01]) + bytes([10, 20, 5, 63]) + struct.pack(">H", 3671)
+    req = struct.pack(">BBHH", 6, 0x10, 0x0201, 6 + len(hpai)) + hpai
+    # DIB ip-current: len=8, type 0x01, ip(4), port(2)
+    dib1 = bytes([8, 0x01]) + bytes([10, 20, 5, 63]) + struct.pack(">H", 3671)
+    # DIB device friendly name: len=12, type 0x02, medium, status, indiv addr, name
+    dib2 = bytes([12, 0x02]) + bytes([0x02, 0x00]) + struct.pack(">H", 0x1101) + b"knxgw\0"
+    resp = struct.pack(">BBHH", 6, 0x10, 0x0202, 6 + len(dib1) + len(dib2)) + dib1 + dib2
+    return req, resp
+
 # --- ARP -------------------------------------------------------------------- #
 def arp_whohas(target_ip, src_key):
     """Who-has from src_key: psrc/hwsrc must be the SENDER's own identity."""
@@ -350,6 +411,15 @@ IPS = {
 MAC["mb_gw"] = "00:90:e8:aa:05:30"     # MOXA Modbus/TCP gateway
 MAC["remote_plc"] = "00:0e:8c:aa:05:31"  # Siemens S7-300 slave behind gw
 MAC["dnpc"] = "00:0b:ab:aa:05:32"      # Advantech DNP3 data concentrator
+# consumer/BAS devices (real OUIs from data/oui.txt)
+MAC["esp_therm"] = "d4:8a:fc:aa:05:60"   # Espressif Inc. (ESPHome-style thermostat)
+IPS["esp_therm"] = "10.20.5.60"
+MAC["honey_therm"] = "00:20:3d:aa:05:61" # Honeywell Environmental (IP thermostat, SSDP)
+IPS["honey_therm"] = "10.20.5.61"
+MAC["nest_hub"] = "60:70:6c:aa:05:62"    # Google, Inc. (smart display hub, mDNS)
+IPS["nest_hub"] = "10.20.5.62"
+MAC["knx_gw"] = "64:16:66:aa:05:63"      # Nest Labs Inc. OUI borrowed for KNX gw demo
+IPS["knx_gw"] = "10.20.5.63"
 
 def build():
     out = []
@@ -370,6 +440,32 @@ def build():
     out += dnp3_link_flow("scada", "dnpc", own_link=3, remote_link=7)
     # C) routed remote PLC: S7 through the MOXA router (TTL decremented)
     out += s7_flow_routed("scada", "remote_plc", via="gw")
+
+    # --- smart-building / IoT devices ---
+    # Espressif thermostat: mDNS PTR/SRV/TXT/A announce (HomeKit-style)
+    out.append(eth_ip_udp(MAC["esp_therm"], "01:00:5e:00:00:fb", IPS["esp_therm"],
+                          "224.0.0.251", 5353, 5353, mdns_ptr_response()))
+    # Google/Nest hub also does a one-shot mDNS service enumeration query
+    out.append(eth_ip_udp(MAC["nest_hub"], "01:00:5e:00:00:fb", IPS["nest_hub"],
+                          "224.0.0.251", 5353, 5353, mdns_query()))
+    # Honeywell IP thermostat: SSDP M-SEARCH (device side) + NOTIFY alive
+    ms, alive = ssdp_msearch_alive(ip=IPS["honey_therm"])
+    out.append(eth_ip_udp(MAC["honey_therm"], "01:00:5e:7f:ff:fa", IPS["honey_therm"],
+                          "239.255.255.250", 1900, 1900, ms))
+    out.append(eth_ip_udp(MAC["honey_therm"], "01:00:5e:7f:ff:fa", IPS["honey_therm"],
+                          "239.255.255.250", 1900, 1900, alive))
+    # ESPHome thermostat -> MQTT broker on the SCADA server
+    conn, pub = mqtt_connect_pub()
+    out.append(eth_ip_tcp(MAC["esp_therm"], MAC["scada"], IPS["esp_therm"],
+                          IPS["scada"], 49152, 1883, conn))
+    out.append(eth_ip_tcp(MAC["esp_therm"], MAC["scada"], IPS["esp_therm"],
+                          IPS["scada"], 49152, 1883, pub))
+    # KNXnet/IP search on multicast 224.0.23.12:3671 + response
+    kreq, kresp = knx_search_req_resp()
+    out.append(eth_ip_udp(MAC["nest_hub"], "01:00:5e:00:17:0c", IPS["nest_hub"],
+                          "224.0.23.12", 3671, 3671, kreq))
+    out.append(eth_ip_udp(MAC["knx_gw"], "01:00:5e:00:17:0c", IPS["knx_gw"],
+                          "224.0.23.12", 3671, 3671, kresp))
 
     # BACnet
     out.append(eth_ip_udp(MAC["bac_ctrl"], "ff:ff:ff:ff:ff:ff", IPS["bac_ctrl"],
