@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Downstream — OT asset graph</title>
+<script src="/static/vendor/d3.v7.min.js"></script>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --panel2: #1c2129; --border: #2d333b;
+    --text: #e6edf3; --dim: #8b949e; --accent: #58a6ff; --danger: #f85149;
+    --warn: #d29922; --ok: #3fb950;
+    --z-l1: #8b6f47; --z-l23: #4a7a8c; --z-ent: #7a4a8c; --z-unk: #57606a;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font: 13px/1.45 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+
+  header { display: flex; align-items: center; gap: 16px; padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--border); flex: 0 0 auto; }
+  header h1 { font-size: 15px; letter-spacing: 3px; color: var(--accent); font-weight: 700; }
+  header h1 span { color: var(--dim); font-weight: 400; letter-spacing: 0; font-size: 11px; margin-left: 8px; }
+  .stats { display: flex; gap: 12px; color: var(--dim); font-size: 12px; }
+  .stats b { color: var(--text); }
+  .spacer { flex: 1; }
+  button { background: #21262d; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 11px; font-size: 12px; cursor: pointer; }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button.danger { color: var(--danger); }
+  button.danger:hover { border-color: var(--danger); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+
+  #main { display: flex; flex: 1 1 auto; overflow: hidden; }
+  #filters { width: 215px; flex: 0 0 auto; background: var(--panel); border-right: 1px solid var(--border); padding: 12px; overflow-y: auto; }
+  #filters h3, #detail h3 { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; margin: 14px 0 6px; }
+  #filters h3:first-child { margin-top: 0; }
+  #filters label { display: flex; align-items: center; gap: 7px; padding: 2px 0; cursor: pointer; color: var(--text); }
+  #filters label.dimmed { color: var(--dim); }
+  #filters input[type=checkbox] { accent-color: var(--accent); }
+  #filters input[type=text] { width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 5px 8px; font-size: 12px; }
+  .chip { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 2px; }
+
+  #graph { flex: 1 1 auto; position: relative; background: var(--bg); }
+  svg { width: 100%; height: 100%; display: block; cursor: grab; }
+  svg:active { cursor: grabbing; }
+  .legend { position: absolute; left: 12px; bottom: 12px; background: rgba(22,27,34,.9); border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px; font-size: 11px; color: var(--dim); pointer-events: none; }
+  .legend div { margin: 2px 0; }
+
+  #detail { width: 330px; flex: 0 0 auto; background: var(--panel); border-left: 1px solid var(--border); overflow-y: auto; padding: 14px; }
+  .finding { border: 1px solid var(--border); border-left: 3px solid var(--dim); border-radius: 6px; padding: 9px 11px; margin-bottom: 9px; background: var(--panel2); cursor: pointer; }
+  .finding:hover { border-color: var(--accent); }
+  .finding.high { border-left-color: var(--danger); }
+  .finding.medium { border-left-color: var(--warn); }
+  .finding.info { border-left-color: var(--accent); }
+  .finding .sev { font-size: 10px; font-weight: 700; letter-spacing: 1px; }
+  .finding.high .sev { color: var(--danger); } .finding.medium .sev { color: var(--warn); } .finding.info .sev { color: var(--accent); }
+  .finding .t { color: var(--text); margin: 3px 0; }
+  .finding .d { color: var(--dim); font-size: 12px; }
+  table.kv { width: 100%; border-collapse: collapse; font-size: 12px; }
+  table.kv td { padding: 3px 6px 3px 0; vertical-align: top; border-bottom: 1px solid #21262d; }
+  table.kv td:first-child { color: var(--dim); white-space: nowrap; width: 95px; }
+  .proto-tag { display: inline-block; background: #21262d; border: 1px solid var(--border); color: var(--accent); border-radius: 4px; padding: 1px 6px; margin: 1px 2px 1px 0; font-size: 11px; font-family: ui-monospace, monospace; }
+  .role-tag { display: inline-block; border-radius: 4px; padding: 1px 6px; margin: 1px 2px 1px 0; font-size: 11px; background: #1f2b1f; color: var(--ok); border: 1px solid #2d4a2d; }
+  .badge-unmanaged { background: #3a1d1d; color: var(--danger); border: 1px solid #6e2b28; border-radius: 4px; padding: 1px 7px; font-size: 11px; font-weight: 600; }
+  .neighbor { color: var(--accent); cursor: pointer; }
+  .neighbor:hover { text-decoration: underline; }
+
+  dialog { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 10px; padding: 18px; width: 480px; }
+  dialog::backdrop { background: rgba(0,0,0,.65); }
+  dialog h2 { font-size: 14px; margin-bottom: 10px; color: var(--accent); }
+  dialog input[type=text] { width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 6px 9px; font-size: 12px; margin-bottom: 10px; }
+  .planbox { max-height: 240px; overflow-y: auto; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px; font-family: ui-monospace, monospace; font-size: 11px; margin-bottom: 10px; white-space: pre-wrap; }
+  .row { display: flex; gap: 8px; justify-content: flex-end; }
+  .note { color: var(--warn); font-size: 11px; margin: 6px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>DOWNSTREAM<span>OT asset discovery</span></h1>
+  <div class="stats">
+    <div>assets <b id="st-assets">0</b></div>
+    <div>conversations <b id="st-edges">0</b></div>
+    <div>findings <b id="st-findings" style="color:var(--danger)">0</b></div>
+  </div>
+  <div class="spacer"></div>
+  <button id="btn-paths">Attack paths</button>
+  <button id="btn-import">Import PCAP</button>
+  <button id="btn-active">Active discovery…</button>
+  <button id="btn-refresh">Refresh</button>
+  <button id="btn-dot">.dot</button>
+  <button id="btn-csv">CSV</button>
+  <button id="btn-md">Report</button>
+</header>
+<div id="main">
+  <div id="filters">
+    <h3>Search</h3>
+    <input type="text" id="search" placeholder="label / ip / vendor…">
+    <h3>Zones</h3>
+    <div id="zone-filters"></div>
+    <h3>Protocols</h3>
+    <div id="proto-filters"></div>
+    <h3>Roles</h3>
+    <div id="role-filters"></div>
+    <h3>Edges</h3>
+    <label><input type="checkbox" id="f-writes" checked> include non-write</label>
+    <label><input type="checkbox" id="f-writesonly"> writes only</label>
+    <h3>Layout</h3>
+    <label><input type="checkbox" id="f-zonesep" checked> group by zone</label>
+  </div>
+  <div id="graph">
+    <svg></svg>
+    <div class="legend" id="legend"></div>
+  </div>
+  <div id="detail"><h3>Findings</h3><div id="findings"></div></div>
+</div>
+
+<dialog id="dlg-import">
+  <h2>Import PCAP files</h2>
+  <p class="note">Server-side paths (one per line). Passive ingest only — no traffic is generated.</p>
+  <input type="text" id="imp-paths" placeholder="/data/captures/plant.pcap">
+  <div class="row"><button id="imp-cancel">Cancel</button><button id="imp-go">Ingest</button></div>
+</dialog>
+
+<dialog id="dlg-active">
+  <h2>Gated active discovery</h2>
+  <p class="note">Dry-run by default. Techniques are gated allow / confirm / block by the loaded
+  scope file; write-class probes do not exist in this tool. Executing requires explicit acknowledgement.</p>
+  <div class="planbox" id="active-plan">loading plan…</div>
+  <div class="row">
+    <button id="act-cancel">Cancel</button>
+    <button id="act-dryrun" class="danger">Plan only (send nothing)</button>
+    <button id="act-execute" class="danger" disabled>--execute --yes</button>
+  </div>
+  <div class="note" id="active-result"></div>
+</dialog>
+
+<script>
+const ZONE_COLORS = {L1:"#8b6f47", L2_L3:"#4a7a8c", L2:"#4a7a8c", L3:"#4a7a8c",
+                     Enterprise:"#7a4a8c", DMZ:"#3d6b4f", Unclassified:"#57606a", Excluded:"#444"};
+const ROLE_SHAPES = {plc:"rect", rtu:"rect", switch:"hexagon", gateway:"diamond",
+                     scada_server:"cylinder", engineering_ws:"house"};
+const d3svg = d3.select("svg");
+let G = {nodes: [], links: [], findings: []};
+let selected = null, sim = null, pathsCache = [];
+
+const $ = s => document.querySelector(s);
+
+function api(path, opts) {
+  return fetch(path, opts).then(r => r.ok ? r.json() : r.json().then(j => Promise.reject(j)));
+}
+
+function loadGraph() {
+  return api("/api/graph").then(g => {
+    G = g;
+    $("#st-assets").textContent = g.nodes.length;
+    $("#st-edges").textContent = g.links.length;
+    $("#st-findings").textContent = g.findings.length;
+    buildFilters();
+    renderFindings();
+    restart();
+  }).catch(e => console.error(e));
+}
+
+/* ---------- filters ---------- */
+let zoneSel = new Set(), protoSel = new Set(), roleSel = new Set();
+function buildFilters() {
+  const zones = [...new Set(G.nodes.map(n => n.zone))];
+  const protos = [...new Set(G.nodes.flatMap(n => n.protocols))].sort();
+  const roles = [...new Set(G.nodes.flatMap(n => n.roles))].sort();
+  zoneSel = new Set(zones); protoSel = new Set(protos); roleSel = new Set(roles);
+  $("#zone-filters").innerHTML = zones.map(z =>
+    `<label><span class="chip" style="background:${ZONE_COLORS[z]||"#666"}"></span>` +
+    `<input type="checkbox" value="${z}" checked> ${z}</label>`).join("");
+  $("#proto-filters").innerHTML = protos.map(p =>
+    `<label><input type="checkbox" value="${p}" checked> ${p}</label>`).join("");
+  $("#role-filters").innerHTML = roles.map(r =>
+    `<label><input type="checkbox" value="${r}" checked> ${r}</label>`).join("");
+  ["#zone-filters", "#proto-filters", "#role-filters"].forEach(sel => {
+    $(sel).addEventListener("change", () => {
+      zoneSel = new Set([...$("#zone-filters").querySelectorAll("input:checked")].map(i => i.value));
+      protoSel = new Set([...$("#proto-filters").querySelectorAll("input:checked")].map(i => i.value));
+      roleSel = new Set([...$("#role-filters").querySelectorAll("input:checked")].map(i => i.value));
+      restart();
+    });
+  });
+}
+
+function nodeVisible(n) {
+  if (!zoneSel.has(n.zone)) return false;
+  if (n.protocols.length && !n.protocols.some(p => protoSel.has(p))) return false;
+  if (n.roles.length && !n.roles.some(r => roleSel.has(r))) return false;
+  const q = $("#search").value.trim().toLowerCase();
+  if (q) {
+    const hay = (n.label + " " + n.ips.join(" ") + " " + n.mac + " " + n.vendor + " " +
+                 n.hostnames.join(" ") + " " + n.protocols.join(" ")).toLowerCase();
+    if (!hay.includes(q)) return false;
+  }
+  return true;
+}
+function linkVisible(l) {
+  const writesOnly = $("#f-writesonly").checked;
+  if (writesOnly && !l.writes) return false;
+  return true;
+}
+
+/* ---------- graph ---------- */
+function restart() {
+  const vis = new Set(G.nodes.filter(nodeVisible).map(n => n.id));
+  const nodes = G.nodes.filter(n => vis.has(n.id)).map(n => ({...n}));
+  const byId = new Map(nodes.map(n => [n.id, n]));
+  const links = G.links
+    .filter(l => vis.has(l.source) && vis.has(l.target) && linkVisible(l))
+    .map(l => ({...l, source: byId.get(l.source), target: byId.get(l.target)}));
+
+  d3svg.selectAll("*").remove();
+  const svgEl = d3svg.node();
+  const W = svgEl.clientWidth, H = svgEl.clientHeight;
+  const gRoot = d3svg.append("g");
+  d3svg.call(d3.zoom().scaleExtent([0.15, 8]).on("zoom", e => gRoot.attr("transform", e.transform)));
+
+  // zone grouping: weak radial layout seeds
+  const zones = [...new Set(nodes.map(n => n.zone))];
+  const zoneAngle = d3.scalePoint().domain(zones).range([0, 2 * Math.PI]);
+  const sep = $("#f-zonesep").checked;
+  nodes.forEach(n => {
+    const a = zoneAngle(n.zone) + (Math.random() - .5) * .7;
+    const r = sep ? Math.min(W, H) * .32 : Math.min(W, H) * .5 * Math.random();
+    n.x = W / 2 + r * Math.cos(a) + (Math.random() - .5) * 60;
+    n.y = H / 2 + r * Math.sin(a) + (Math.random() - .5) * 60;
+  });
+
+  sim = d3.forceSimulation(nodes)
+    .force("link", d3.forceLink(links).id(d => d.id).distance(d => d.writes ? 90 : 130).strength(.35))
+    .force("charge", d3.forceManyBody().strength(-420))
+    .force("center", d3.forceCenter(W / 2, H / 2))
+    .force("collide", d3.forceCollide(26));
+
+  const link = gRoot.append("g").selectAll("line").data(links).join("line")
+    .attr("stroke", d => d.writes ? "#f85149" : "#3d4450")
+    .attr("stroke-width", d => d.writes ? 2.2 : 1.1)
+    .attr("stroke-dasharray", d => d.proto === "profinet_rt" ? "2 3" : null)
+    .attr("marker-end", "none");
+
+  const linkLabel = gRoot.append("g").selectAll("text").data(links).join("text")
+    .text(d => d.proto + (d.writes ? ` ✎${d.writes}` : "") + (d.exceptions ? ` ⚠${d.exceptions}` : ""))
+    .attr("fill", d => d.writes ? "#f85149" : "#6e7681")
+    .attr("font-size", 9).attr("font-family", "ui-monospace, monospace")
+    .attr("text-anchor", "middle");
+
+  const node = gRoot.append("g").selectAll("g").data(nodes).join("g")
+    .style("cursor", "pointer")
+    .call(d3.drag()
+      .on("start", (e, d) => { if (!e.active) sim.alphaTarget(.25).restart(); d.fx = d.x; d.fy = d.y; })
+      .on("drag", (e, d) => { d.fx = e.x; d.fy = e.y; })
+      .on("end", (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; }));
+
+  node.append("path")
+    .attr("d", d => shapePath(ROLE_SHAPES[[...d.roles].find(r => ROLE_SHAPES[r])] || "circle", 15))
+    .attr("fill", d => ZONE_COLORS[d.zone] || "#57606a")
+    .attr("stroke", d => d.unmanaged ? "#f85149" : "#0d1117")
+    .attr("stroke-width", d => d.unmanaged ? 3 : 1.5);
+  node.append("text")
+    .text(d => d.label.length > 22 ? d.label.slice(0, 21) + "…" : d.label)
+    .attr("dy", 30).attr("text-anchor", "middle")
+    .attr("fill", "#e6edf3").attr("font-size", 11);
+
+  node.on("click", (e, d) => { selected = d.id; showDetail(d); highlight(); e.stopPropagation(); });
+  d3svg.on("click", () => { selected = null; renderFindings(); highlight(); });
+
+  const neighbor = new Map();
+  links.forEach(l => {
+    neighbor.set(l.source.id, (neighbor.get(l.source.id) || new Set()).add(l.target.id));
+    neighbor.set(l.target.id, (neighbor.get(l.target.id) || new Set()).add(l.source.id));
+  });
+
+  function highlight() {
+    const focus = selected ? new Set([selected, ...(neighbor.get(selected) || [])]) : null;
+    node.attr("opacity", d => !focus || focus.has(d.id) ? 1 : .15);
+    link.attr("opacity", l => !focus || (l.source.id === selected || l.target.id === selected) ? 1 : .06);
+    linkLabel.attr("opacity", l => !focus || (l.source.id === selected || l.target.id === selected) ? 1 : 0);
+  }
+
+  sim.on("tick", () => {
+    link.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
+        .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
+    linkLabel.attr("x", d => (d.source.x + d.target.x) / 2).attr("y", d => (d.source.y + d.target.y) / 2 - 3);
+    node.attr("transform", d => `translate(${d.x},${d.y})`);
+  });
+
+  $("#legend").innerHTML =
+    zones.map(z => `<div><span class="chip" style="background:${ZONE_COLORS[z]||"#666"}"></span>${z}</div>`).join("") +
+    `<div style="margin-top:6px"><span style="color:#f85149">✎</span> write-class &nbsp; <span style="color:#6e7681">—</span> conversation</div>` +
+    `<div><span style="color:#f85149">◯</span> red ring = unmanaged device</div>`;
+}
+
+function shapePath(shape, r) {
+  switch (shape) {
+    case "rect": return `M${-r},${-r*.75}h${2*r}v${1.5*r}h${-2*r}z`;
+    case "hexagon": { const h = r*.87; return `M${r*.5},${-h}L${r},0L${r*.5},${h}L${-r*.5},${h}L${-r},0L${-r*.5},${-h}z`; }
+    case "diamond": return `M0,${-r*1.1}L${r*.9},0L0,${r*1.1}L${-r*.9},0z`;
+    case "cylinder": return `M${-r*.8},${-r*.7}a${r*.8},${r*.3} 0 0 0 ${1.6*r},0v${1.25*r}a${r*.8},${r*.3} 0 0 1 ${-1.6*r},0z`;
+    case "house": return `M0,${-r}L${r*.95},${-r*.15}v${r}h${-1.9*r}v${-r}z`;
+    default: return d3.symbol(d3.symbolCircle, 15 * 15)();
+  }
+}
+
+/* ---------- detail / findings ---------- */
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+function showDetail(n) {
+  const names = G.nodes;
+  const nbrs = G.links.filter(l => l.source.id === n.id || l.target.id === n.id);
+  const talk = `<table class="kv">` + nbrs.map(l => {
+    const other = l.source.id === n.id ? l.target : l.source;
+    const dir = l.source.id === n.id ? "→" : "←";
+    return `<tr><td>${dir} <span class="neighbor" data-id="${esc(other.id)}">${esc(other.label)}</span></td>` +
+           `<td>${esc(l.proto)}${l.writes ? ` <span style="color:var(--danger)">✎${l.writes}</span>` : ""}` +
+           `${l.exceptions ? ` <span style="color:var(--warn)">⚠${l.exceptions}</span>` : ""} ×${l.count}</td></tr>`;
+  }).join("") + `</table>`;
+  $("#detail").innerHTML = `
+    <h3>Asset</h3>
+    <div style="font-size:15px;font-weight:600;margin-bottom:2px">${esc(n.label)}</div>
+    ${n.unmanaged ? `<div class="badge-unmanaged" style="display:inline-block;margin:4px 0">UNMANAGED DEVICE</div>` : ""}
+    <table class="kv">
+      <tr><td>Zone</td><td>${esc(n.zone)} <span style="color:var(--dim)">(${esc(n.purdue)})</span></td></tr>
+      <tr><td>IPs</td><td>${n.ips.map(esc).join("<br>") || "—"}</td></tr>
+      <tr><td>MAC</td><td style="font-family:ui-monospace,monospace">${esc(n.mac) || "—"}</td></tr>
+      <tr><td>Vendor</td><td>${esc(n.vendor) || "—"}</td></tr>
+      <tr><td>Hostnames</td><td>${n.hostnames.map(esc).join("<br>") || "—"}</td></tr>
+      <tr><td>Protocols</td><td>${n.protocols.map(p => `<span class="proto-tag">${esc(p)}</span>`).join("") || "—"}</td></tr>
+      <tr><td>Roles</td><td>${n.roles.map(r => `<span class="role-tag">${esc(r)}</span>`).join("") || "—"}</td></tr>
+      ${Object.entries(n.attributes || {}).map(([k, v]) => `<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`).join("")}
+      <tr><td>Packets</td><td>${n.pkt_count}</td></tr>
+      <tr><td>First / last</td><td>${esc(n.first_seen)}<br>${esc(n.last_seen)}</td></tr>
+    </table>
+    <h3>Conversations</h3>${talk || "<div style='color:var(--dim)'>none observed</div>"}`;
+  $("#detail").querySelectorAll(".neighbor").forEach(el =>
+    el.addEventListener("click", () => {
+      const t = G.nodes.find(x => x.id === el.dataset.id);
+      if (t) { selected = t.id; showDetail(t); }
+    }));
+}
+
+function renderFindings() {
+  const order = {high: 0, medium: 1, info: 2};
+  $("#detail").innerHTML = `<h3>Findings</h3>` + G.findings
+    .sort((a, b) => (order[a.severity] ?? 3) - (order[b.severity] ?? 3))
+    .map((f, i) => `
+      <div class="finding ${f.severity}" data-i="${i}">
+        <span class="sev">${f.severity.toUpperCase()}</span>
+        <div class="t">${esc(f.title)}</div>
+        <div class="d">${esc(f.description)}</div>
+      </div>`).join("") || "<div style='color:var(--dim)'>No findings. Click a node for detail.</div>";
+  $("#detail").querySelectorAll(".finding").forEach(el =>
+    el.addEventListener("click", () => {
+      const f = G.findings[+el.dataset.i];
+      if (f && f.assets && f.assets[0]) {
+        selected = f.assets[0];
+        const n = G.nodes.find(x => x.id === selected);
+        if (n) showDetail(n);
+      }
+    }));
+}
+
+function renderPaths() {
+  $("#detail").innerHTML = `<h3>Enterprise → PLC paths</h3>
+    <div style="color:var(--dim);font-size:11px;margin-bottom:8px">
+      BFS over observed conversations (incl. gateway bridges). Observed traffic
+      only — not confirmed reachability.</div>` +
+    (pathsCache.length ? pathsCache.map((p, i) => `
+      <div class="finding ${p.depth >= 3 ? 'medium' : 'info'}" data-i="${i}">
+        <span class="sev">${p.depth} HOP${p.depth > 1 ? 'S' : ''}</span>
+        <div class="t">${esc(p.from_label)} → ${esc(p.to_label)}</div>
+        <div class="d">${p.hops.map(h => `${esc(h.from_label)} <span style="color:var(--accent)">-${esc(h.proto)}-&gt;</span> ${esc(h.to_label)}`).join("<br>")}</div>
+      </div>`).join("") :
+    "<div style='color:var(--dim)'>No enterprise-to-PLC paths observed.</div>");
+  $("#detail").querySelectorAll(".finding").forEach(el =>
+    el.addEventListener("click", () => {
+      const p = pathsCache[+el.dataset.i];
+      if (p) { selected = p.to; const n = G.nodes.find(x => x.id === p.to); if (n) showDetail(n); }
+    }));
+}
+
+$("#btn-paths").onclick = () => {
+  api("/api/paths").then(r => { pathsCache = r.paths; renderPaths(); })
+    .catch(e => console.error(e));
+};
+
+/* ---------- header actions ---------- */
+$("#btn-refresh").onclick = loadGraph;
+$("#search").addEventListener("input", restart);
+$("#f-writesonly").addEventListener("change", restart);
+$("#f-zonesep").addEventListener("change", restart);
+$("#btn-dot").onclick = () => window.open("/api/export/dot", "_blank");
+$("#btn-csv").onclick = () => window.open("/api/export/csv", "_blank");
+$("#btn-md").onclick = () => window.open("/api/export/md", "_blank");
+
+$("#btn-import").onclick = () => { $("#imp-paths").value = ""; $("#dlg-import").showModal(); };
+$("#imp-cancel").onclick = () => $("#dlg-import").close();
+$("#imp-go").onclick = () => {
+  const paths = $("#imp-paths").value.split("\n").map(s => s.trim()).filter(Boolean);
+  if (!paths.length) return;
+  api("/api/pcap", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({paths})})
+    .then(r => { $("#dlg-import").close(); loadGraph(); })
+    .catch(e => alert("import failed: " + (e.error || JSON.stringify(e))));
+};
+
+$("#btn-active").onclick = () => {
+  $("#active-result").textContent = "";
+  $("#act-execute").disabled = true;
+  api("/api/active/plan", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"})
+    .then(r => {
+      const c = r.counts;
+      $("#active-plan").textContent =
+        `plan: ${r.tasks.length} tasks\n  allow:   ${c.allow}\n  confirm: ${c.confirm}\n  block:   ${c.block}\n\n` +
+        r.tasks.slice(0, 60).map(t => `${t.decision.padEnd(8)} ${t.technique.padEnd(10)} ${t.ip || "-"}`).join("\n") +
+        (r.tasks.length > 60 ? `\n... ${r.tasks.length - 60} more` : "");
+      $("#act-execute").disabled = false;
+      $("#dlg-active").showModal();
+    });
+};
+$("#act-cancel").onclick = () => $("#dlg-active").close();
+$("#act-dryrun").onclick = () => { $("#active-result").textContent = "Dry-run only — nothing was sent. Use the CLI (--execute --yes) to run the plan."; };
+$("#act-execute").onclick = () => {
+  if (!confirm("Send gated active probes to in-scope targets?\n\nconfirm-class techniques require acknowledgement — this counts as it.")) return;
+  api("/api/active/run", {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({execute: true, yes: true})})
+    .then(r => { $("#active-result").textContent = `sent=${r.sent} skipped=${r.skipped} blocked=${r.blocked} errors=${(r.errors||[]).length}`; loadGraph(); })
+    .catch(e => $("#active-result").textContent = "error: " + JSON.stringify(e));
+};
+
+window.addEventListener("resize", () => { /* relayout lazily */ });
+loadGraph();
+</script>
+</body>
+</html>
