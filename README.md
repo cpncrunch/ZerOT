@@ -82,6 +82,16 @@ python3 downstream.py ingest plant.pcap --scope scope.json --db state.json
 python3 downstream.py import-nmap plant.xml --scope scope.json --db state.json
 ```
 
+## Product → CVE enrichment (offline)
+
+Identified products (ENIP list-identity strings, S7 SZL module names, nmap
+product/OS) are matched against a curated OT CVE database
+(`data/ot_cves.json`, 500+ CVEs across 19 product families) built from live
+NVD 2.0 API queries by `scripts/build_cve_db.py` with a vendor-relevance
+filter — nothing is hand-typed. Runtime lookup is pure offline; findings cite
+the db generation date and remind you to verify version applicability.
+Refresh the db with `python3 scripts/build_cve_db.py` (needs network, ~3 min).
+
 ## Evidence provenance
 
 Every asset, conversation, and finding carries citation records — source pcap
@@ -160,7 +170,7 @@ blocked at execution time.
 python3 -m pytest tests/ -q
 ```
 
-47 tests over the synthetic known-answer fixture: vendors, roles, edges,
+49 tests over the synthetic known-answer fixture: vendors, roles, edges,
 gateway/concentrator virtual children, router-guard, TTL hop inference, attack
 paths, smart-building/IoT devices (mDNS/SSDP/MQTT/KNX), IoT-on-OT findings,
 active gating (dry-run, unknown-technique block, confirm-requires-yes),

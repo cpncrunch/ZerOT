@@ -60,6 +60,18 @@ def load_oui(path: Path = OUI_PATH) -> dict:
 
 OUI = load_oui()
 
+CVE_PATH = ROOT / "data" / "ot_cves.json"
+
+def load_cve_db(path: Path = CVE_PATH) -> dict:
+    """Curated OT product -> CVE list, generated from live NVD queries by
+    scripts/build_cve_db.py. Pure offline lookup at runtime."""
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"products": {}}
+
+CVE_DB = load_cve_db()
+
 CONSUMER_VENDOR_PREFIXES = (
     "Apple", "Dell", "Lenovo", "ASUSTek", "Gigabyte", "Micro-Star", "MSI",
     "Samsung", "Xiaomi", "Espressif", "Google", "ecobee", "Nest Labs",
@@ -1190,6 +1202,60 @@ class Model:
                               "flat-network finding and a wireless-to-OT pivot path."
                         ),
                     })
+
+        # product -> CVE enrichment (offline curated db; see data/ot_cves.json)
+        CVE_MATCH_STRINGS = {
+            "Allen-Bradley ControlLogix 1756": ["1756"],
+            "Siemens S7-300": ["cpu 315", "s7-300", "6es7 315", "6es7315"],
+            "Siemens S7-1200": ["s7-1200", "cpu 121", "6es7 21", "6es721"],
+            "Siemens S7-1500": ["s7-1500", "cpu 15", "6es7 51", "6es751"],
+            "Schneider Modicon M221": ["tm221", "m221"],
+            "Schneider Modicon M340": ["m340", "bmx ami"],
+            "Schneider BMX NOE": ["bmx noe", "bmxnoe"],
+            "Moxa NPort": ["nport"],
+            "Moxa EDS switch": ["eds-"],
+            "Wago 750/ PFC": ["wago 750", "pfc200"],
+        }
+        CVE_SEV = {None: "medium", "info": "info", "low": "info"}
+        for a in sorted(self.assets.values(), key=lambda x: x.id):
+            strings = " ".join(filter(None, [
+                a.attrs.get("enip_product", ""),
+                a.attrs.get("s7_module", ""), a.attrs.get("s7_basic_hardware", ""),
+                a.attrs.get("nmap_product", ""), a.attrs.get("nmap_os", ""),
+            ])).lower()
+            if not strings.strip():
+                continue
+            matched_family, matched_cves = "", []
+            for family, needles in CVE_MATCH_STRINGS.items():
+                if any(n in strings for n in needles):
+                    matched_cves = CVE_DB.get("products", {}).get(family, [])
+                    if matched_cves:
+                        matched_family = family
+                        break
+            if not matched_family:
+                continue
+            hits = [c for c in matched_cves if (c.get("cvss") or 0) >= 7.0][:6]
+            top = max((c.get("cvss") or 0) for c in matched_cves)
+            sev = "high" if top >= 9.0 else ("medium" if top >= 7.0 else "info")
+            f.append({
+                "id": f"cve-{a.id}",
+                "severity": sev,
+                "title": f"Known CVEs for identified product: {a.label} — {matched_family}",
+                "assets": [a.id],
+                "evidence": {
+                    "product": matched_family,
+                    "matched_on": strings[:80],
+                    "cve_count_total": len(matched_cves),
+                    "top_cves": [{"id": c["id"], "cvss": c["cvss"], "desc": c["desc"]} for c in hits],
+                    "db_generated": CVE_DB.get("_meta", {}).get("generated", "?"),
+                    "provenance": a.evidence[:6],
+                },
+                "description": (
+                    f"Device identified as {matched_family} from observed product strings; "
+                    f"the curated NVD-derived database lists {len(matched_cves)} CVEs "
+                    f"(max CVSS {top}). Verify firmware version applicability before reporting."
+                ),
+            })
 
         for e in self.edges.values():
             if e.proto not in OT_PROTOCOLS:

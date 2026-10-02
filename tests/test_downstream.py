@@ -712,3 +712,36 @@ def test_import_nmap_fuses_and_enriches(model):
     # passive evidence untouched: modbus edge still cites pcap frames
     e = model.edges[("00:1E:C2:AA:05:88", "00:80:F4:AA:05:12", "modbus")]
     assert any("ot_plant.pcap" in x["source"] for x in e.evidence)
+
+
+def test_cve_enrichment_matches_identified_products(model):
+    """Identified products get CVE findings citing the curated db; consumer
+    gear gets none."""
+    cve_findings = [x for x in model.findings if x["id"].startswith("cve-")]
+    ab = next(a for a in model.assets.values() if a.attrs.get("enip_product"))
+    hit = next(x for x in cve_findings if ab.id in x["assets"])
+    assert hit["evidence"]["product"] == "Allen-Bradley ControlLogix 1756"
+    assert hit["evidence"]["top_cves"], "no top CVEs surfaced"
+    assert all(c["cvss"] >= 7.0 for c in hit["evidence"]["top_cves"])
+    assert hit["severity"] in ("high", "medium")
+    # consumer devices (laptop/thermostats) must NOT get CVE findings
+    lap = model.assets.get("00:1E:C2:AA:05:88")
+    assert not any(lap.id in x["assets"] for x in cve_findings)
+    # provenance rides along
+    assert hit["evidence"]["provenance"]
+    # db generation date surfaced for report-time verification
+    assert hit["evidence"]["db_generated"]
+
+
+def test_cve_db_is_verified_source():
+    """The shipped db must exist, be NVD-tagged, and have consistent shape."""
+    db = ds.CVE_DB
+    assert db.get("_meta", {}).get("source") == "NVD 2.0 API"
+    n = 0
+    for family, cves in db.get("products", {}).items():
+        assert isinstance(cves, list) and cves, family
+        for c in cves:
+            assert c["id"].startswith("CVE-"), c
+            assert c["url"].startswith("https://nvd.nist.gov/vuln/detail/"), c
+            n += 1
+    assert n >= 50, f"db too thin: {n}"
