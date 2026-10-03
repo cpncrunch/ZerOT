@@ -82,6 +82,7 @@
     <div>findings <b id="st-findings" style="color:var(--danger)">0</b></div>
   </div>
   <div class="spacer"></div>
+  <button id="btn-timeline">Timeline</button>
   <button id="btn-paths">Attack paths</button>
   <button id="btn-import">Import PCAP</button>
   <button id="btn-active">Active discovery…</button>
@@ -112,6 +113,13 @@
   </div>
   <div id="detail"><h3>Findings</h3><div id="findings"></div></div>
 </div>
+
+<dialog id="dlg-timeline">
+  <h2>Activity timeline</h2>
+  <p class="note">Chronological: asset first/last sightings, conversation starts, findings.</p>
+  <div id="timeline-body" style="max-height:60vh;overflow:auto"></div>
+  <div class="row"><button id="tl-close">Close</button></div>
+</dialog>
 
 <dialog id="dlg-import">
   <h2>Import PCAP files</h2>
@@ -404,6 +412,23 @@ $("#btn-paths").onclick = () => {
   api("/api/paths").then(r => { pathsCache = r.paths; renderPaths(); })
     .catch(e => console.error(e));
 };
+
+$("#btn-timeline").onclick = () => {
+  api("/api/timeline").then(r => {
+    const KIND = {asset_first: ["＋", "var(--ok)"], asset_last: ["·", "var(--dim)"],
+                  conv_first: ["→", "var(--accent)"], finding: ["!", "var(--danger)"]};
+    $("#timeline-body").innerHTML = r.items.slice().reverse().map(i => {
+      const [sym, color] = KIND[i.kind] || ["?", "var(--dim)"];
+      const sev = i.severity ? ` <span style="color:var(--danger)">[${i.severity}]</span>` : "";
+      const extra = i.writes ? ` <span style="color:var(--danger)">✎${i.writes}</span>` : "";
+      return `<div class="ev"><span style="color:${color};width:1.2em;display:inline-block">${sym}</span>` +
+             `<span style="font-family:ui-monospace,monospace;color:var(--dim)">${esc((i.ts||"").replace("T"," ").split("+")[0])}</span>` +
+             ` ${esc(i.label || i.id)}${sev}${extra}</div>`;
+    }).join("") || "<div style='color:var(--dim)'>no activity recorded</div>";
+    $("#dlg-timeline").showModal();
+  }).catch(e => console.error(e));
+};
+$("#tl-close").onclick = () => $("#dlg-timeline").close();
 
 /* ---------- header actions ---------- */
 $("#btn-refresh").onclick = loadGraph;

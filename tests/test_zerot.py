@@ -885,3 +885,118 @@ def test_stale_cli_reports_silent_assets(tmp_path, model):
         rc2 = ds.main(["stale", "--db", str(db2), "--days", "7"])
     assert rc2 == 0
     assert "no assets silent" in buf2.getvalue()
+
+
+# ---- roadmap round: GOOSE/SV, snmp_sysdesc, watch, timeline ----------------- #
+
+
+def test_goose_publisher_identity(model):
+    """GOOSE self-describes: gocbRef/goID names the IED, datSet says what it
+    publishes, stNum counts state transitions. One frame = one living IED."""
+    pub = [a for a in model.assets.values() if "goose_publisher" in a.roles]
+    assert len(pub) == 1
+    a = pub[0]
+    assert a.attrs.get("goose_goid") == "IED1_QSB1"
+    assert "IED1_QSB1" in a.hostnames
+    assert a.attrs.get("goose_datset") == "IED1_QSB1/LLN0$GO$gcbAnalog1"
+    assert a.attrs.get("goose_stnum") == 1139
+    assert "goose" in a.protocols
+
+
+def test_sv_publisher(model):
+    """Sampled Values: L2 IP-less stream from a merging unit; noASDU = samples
+    per PDU."""
+    pub = [a for a in model.assets.values() if "sv_publisher" in a.roles]
+    assert len(pub) == 1
+    a = pub[0]
+    assert a.id == "00:40:9D:AA:05:51"
+    assert a.attrs.get("sv_noasdu") == 1
+    assert any(e.proto == "sv" for e in model.edges.values())
+
+
+def test_snmp_sysdesc_probe_against_fixture_agent():
+    """Active SNMP GET against a local fixture agent; response folds through
+    the passive dissector (identical attrs both paths)."""
+    import socket, threading
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import gen_ot_pcap as g
+
+    resp = g.snmp_response("public", "Cisco IOS Software, C2960 Software (C2960-LANLITEK9-M)",
+                           "SW-TEST-01", "Lab bench")
+    srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    srv.bind(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    done = threading.Event()
+
+    def agent():
+        try:
+            data, addr = srv.recvfrom(4096)
+            # echo request-id back in a response PDU
+            import zerot as _z
+            parsed = _z._snmp_parse(data)
+            assert parsed is not None and parsed[0] == 0, "fixture agent got a bad GET"
+            srv.sendto(resp, addr)
+        except OSError:
+            pass
+        finally:
+            done.set()
+
+    threading.Thread(target=agent, daemon=True).start()
+    m = Model()
+    r = ds._probe_snmp_sysdesc("127.0.0.1", m, port=port, timeout=2.0)
+    done.wait(2)
+    srv.close()
+    assert r is not None, "probe got no response"
+    assert "C2960" in r["sysDescr"]
+    assert r["sysName"] == "SW-TEST-01"
+    a = m.resolve(ip="127.0.0.1")
+    assert a.attrs.get("snmp_sysLocation") == "Lab bench"   # passive path attrs
+
+
+def test_watch_detects_new_device_and_finding(tmp_path):
+    """watch = cron-able drift alert: fold a new pcap, diff vs baseline.
+    A rogue master appearing must surface as new asset + findings (rc=2)."""
+    import io, contextlib
+    # day-2 capture: rogue Espressif laptop masters a Modbus write
+    from scapy.all import Ether, IP, TCP, Raw, wrpcap
+    rogue_mac = "d4:8a:fc:bb:06:99"
+    req = bytes.fromhex("000100000006011003000001")     # FC16 write request-ish
+    p2 = tmp_path / "day2.pcap"
+    wrpcap(str(p2), [Ether(src=rogue_mac, dst=MAC_OF("plc_mb"), type=0x0800) /
+                     IP(src="10.20.5.99", dst="10.20.5.12") /
+                     TCP(sport=49300, dport=502, flags="PA", seq=1) / Raw(load=req)])
+    scope_file = tmp_path / "scope.json"
+    scope_file.write_text(json.dumps(SCOPE))
+    db = tmp_path / "watch_state.json"
+    # seed baseline with the known-good fixture only
+    r0 = subprocess.run([sys.executable, str(ROOT / "zerot.py"), "ingest", str(FIXTURE),
+                         "--scope", str(scope_file), "--db", str(db)],
+                        capture_output=True, text=True, timeout=120)
+    assert r0.returncode == 0, r0.stderr
+    r = subprocess.run([sys.executable, str(ROOT / "zerot.py"), "watch", str(p2),
+                        "--scope", str(scope_file), "--db", str(db),
+                        "--min-sev", "medium"],
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 2, f"expected rc=2 (new findings), got {r.returncode}: {r.stdout}\n{r.stderr}"
+    assert "new asset" in r.stdout
+    assert "10.20.5.99" in r.stdout or "d4:8a:fc" in r.stdout.lower()
+
+
+def MAC_OF(key):
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import gen_ot_pcap as g
+    return g.MAC[key]
+
+
+def test_timeline_shape(model):
+    """timeline() = sorted unified feed of asset/conversation/finding events."""
+    tl = model.timeline()
+    assert len(tl) > 20
+    kinds = {i["kind"] for i in tl}
+    assert "asset_first" in kinds
+    assert "conv_first" in kinds
+    assert "finding" in kinds
+    ts_list = [i["ts"] for i in tl]
+    assert ts_list == sorted(ts_list)               # chronological
+    tl2 = model.timeline(limit=5)
+    assert len(tl2) == 5 and tl2 == tl[-5:]         # limit keeps the tail

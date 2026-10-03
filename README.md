@@ -20,7 +20,7 @@ enterprise→PLC traversal.*
 | Layer | Source | Output |
 |---|---|---|
 | Devices | Ethernet/ARP/DHCP/LLDP/**CDP**/NBNS/PN-DCP/**IPv6 NDP** | assets with MAC↔IP, vendor (IEEE OUI), hostnames |
-| Conversations | Modbus, S7comm, EtherNet/IP, DNP3, IEC 60870-5-104, OPC UA, BACnet, PROFINET RT, MQTT | directed master→slave / client→broker edges, write counts, exception counts |
+| Conversations | Modbus, S7comm, EtherNet/IP, DNP3, IEC 60870-5-104, OPC UA, BACnet, PROFINET RT, MQTT, **GOOSE**, **Sampled Values (61850-9-2)** | directed master→slave / client→broker edges, write counts, exception counts |
 | Products | CIP Identity (listIdentity), PN-DCP, DHCP | product names ("1756-L83E"), station names |
 | **Identity enrichment** | **SNMP v1/v2c** (passive: community strings, sysDescr/sysName/sysLocation/sysContact) | switch/RTU/gateway identity; default communities are themselves a finding-grade fact |
 | **Encrypted links** | **TLS ClientHello SNI** (any TCP port) | HTTPS HMI / TLS-MQTT hostnames — metadata only, no decryption |
@@ -33,6 +33,8 @@ enterprise→PLC traversal.*
 | Risk | consumer-vendor device in OT zone, rogue OT master, enterprise→control session, write activity | findings (high/medium/info) |
 | Attack paths | BFS from enterprise masters to PLC/RTUs across all edges incl. bridges | multi-hop enterprise→PLC paths |
 | **Drift** | `last_seen` per asset | `zerot stale --days N` lists assets silent for N days |
+| **Drift alerting** | `zerot watch` (diff vs baseline) | new findings/assets on new captures; cron-able exit codes (0 quiet / 1 new asset / 2 new finding) |
+| **Timeline** | asset/conversation/finding timestamps | `/api/timeline` + UI Timeline panel |
 
 ## Install
 
@@ -132,6 +134,27 @@ Lists assets whose last on-the-wire activity is older than the threshold —
 candidates for decommissioned gear, dead sensors, or inventory drift. Frame it
 as an observation: silent ≠ gone (a PLC polled once a day is silent 23h).
 
+## Watch mode (cron-able drift alerting)
+
+```
+# nightly: fold the day's capture in, alert on anything NEW
+python3 zerot.py watch today.pcap --scope scope.json --db state.json --min-sev medium
+```
+
+Diffs the post-ingest state against the pre-ingest baseline (kept at
+`state.baseline.json`): new findings at/above `--min-sev` and new assets are
+printed (`--json` for machines). Exit codes suit cron/systemd: `0` quiet,
+`1` new device on the network, `2` new finding — a new master appearing on an
+OT segment pages you, routine rediscovery doesn't.
+
+## IEC 61850 (GOOSE / Sampled Values)
+
+Layer-2, IP-less: GOOSE (0x88B8) publishers are identified by MAC + gocbRef
+(IEED name) + datSet (what it publishes) + stNum; SV (0x88BA) merging units
+by MAC + noASDU. Works through VLAN tags. These are the protection-grade
+protocols — tripping signals and CT/VT streams — so their presence alone
+usually marks a safety-relevant segment: treat as observe-only.
+
 ## Layer crawling
 
 ```
@@ -170,7 +193,7 @@ the previous round learned. It stops when no new targets appear.
 **Write-class probes do not exist in this tool.** The technique registry is a
 closed set of read-only discovery methods (`arp_ping`, `tcp_probe`, `modbus_id`,
 `enip_list`, `mdns_query`, `ssdp_msearch`,
-`modbus_unit_sweep`, `bacnet_whois`, `s7_szl`); unknown technique names are hard
+`modbus_unit_sweep`, `bacnet_whois`, `s7_szl`, `snmp_sysdesc`); unknown technique names are hard
 blocked at execution time.
 
 ## API (serve mode)
@@ -179,6 +202,7 @@ blocked at execution time.
 |---|---|---|
 | GET | /api/graph | nodes/links/findings |
 | GET | /api/paths | enterprise→PLC multi-hop paths |
+| GET | /api/timeline | chronological asset/conversation/finding feed |
 | GET | /api/events | ingest/active event log |
 | POST | /api/pcap | `{"paths": [...]}` server-side pcap ingest |
 | POST | /api/active/plan | plan with allow/confirm/block counts |
@@ -191,13 +215,14 @@ blocked at execution time.
 python3 -m pytest tests/ -q
 ```
 
-57 tests over the synthetic known-answer fixture: vendors, roles, edges,
+62 tests over the synthetic known-answer fixture: vendors, roles, edges,
 gateway/concentrator virtual children, router-guard (scope-derived boundaries
 + /23 merge), TTL hop inference, attack paths, smart-building/IoT devices
 (mDNS/SSDP/MQTT/KNX), IoT-on-OT findings, CDP/VLAN-through-tag/SNMP
 community+system-group/TLS SNI/NDP identity, banner grab, staleness CLI,
-active gating (dry-run, unknown-technique block, confirm-requires-yes),
-exports, save/load roundtrip, CLI smoke.
+GOOSE/SV 61850 dissectors, snmp_sysdesc probe, watch drift alerting,
+timeline shape, active gating (dry-run, unknown-technique block,
+confirm-requires-yes), exports, save/load roundtrip, CLI smoke.
 
 ## Safety posture
 

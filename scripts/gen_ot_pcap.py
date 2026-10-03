@@ -541,6 +541,39 @@ def ndp_frames():
           ICMPv6NDOptSrcLLAddr(lladdr=mac))
     return na, ns
 
+# --- IEC 61850 GOOSE / Sampled Values ------------------------------------------ #
+def goose_ber_str(ctx, s):
+    """Context-tagged BER visible-string (goID/datSet)."""
+    b = s.encode()
+    if len(b) < 0x80:
+        return bytes([ctx, len(b)]) + b
+    raise ValueError("keep fixture strings short")
+
+def goose_frame(goid="IED1_QSB1", datset="IED1_QSB1/LLN0$GO$gcbAnalog1", stnum=1139):
+    """GOOSE publish: ethertype 0x88B8 -> 01-0C-CD-01-00-00.
+    Header: appid(2) len(2) rsv(4); APDU = BER context-tagged sequence.
+    61850-8-1 field order: [81]gocbRef [83]timeAllowedToLive [82]datSet
+    [85]stNum [86]sqNum — ZerOT keys identity off gocbRef(81)/datSet(82)."""
+    apdu = goose_ber_str(0x81, goid)                       # gocbRef/goID
+    apdu += bytes([0x83, 2]) + struct.pack(">H", 60000)     # timeAllowedToLive
+    apdu += goose_ber_str(0x82, datset)                    # datSet
+    apdu += bytes([0x85, 2]) + struct.pack(">H", stnum)     # stNum (16-bit)
+    apdu += bytes([0x86, 1]) + b"\x00"                     # sqNum
+    hdr = struct.pack(">HH", 0x0001, len(apdu)) + b"\x00\x00\x00\x00"
+    body = hdr + apdu
+    return Ether(src=MAC["ied1"], dst="01:0c:cd:01:00:00", type=0x88B8) / Raw(load=body)
+
+def sv_frame():
+    """IEC 61850-9-2 SV: ethertype 0x88BA -> 01-0C-CD-04-00-00. Merging unit
+    streams samples to subscribed relays. noASDU sits at the head of the
+    savPDU sequence body; we keep one minimal ASDU."""
+    asdu = bytes([0x30, 6]) + b"\x00\x01\x00\x02\x00\x03"[:6]
+    inner = bytes([0x80, 1, 1]) + asdu          # noASDU ctx-0 + one asdu seq
+    sav = bytes([0x60]) + bytes([len(inner)]) + inner
+    hdr = struct.pack(">HH", 0x4000, len(sav)) + b"\x00\x00\x00\x00"
+    body = hdr + sav
+    return Ether(src=MAC["mu1"], dst="01:0c:cd:04:00:00", type=0x88BA) / Raw(load=body)
+
 # ============================================================================
 IPS = {
     "plc_s7": "10.20.5.11", "plc_mb": "10.20.5.12", "plc_ab": "10.20.5.13",
@@ -568,6 +601,9 @@ MAC["cisco_sw"] = "00:1b:0d:aa:09:09"    # Cisco Systems, Inc OUI
 IPS["cisco_sw"] = "10.20.9.9"
 MAC["hmi"] = "00:0c:29:aa:09:40"         # VMware, Inc. (engineering HMI, dual-stack)
 IPS["hmi"] = "10.20.9.40"
+MAC["ied1"] = "00:40:9d:aa:05:50"        # DigiBoard (per oui.txt; 61850 bay IED)
+MAC["mu1"] = "00:40:9d:aa:05:51"         # merging unit (SV publisher)
+MAC["relay1"] = "00:40:9d:aa:05:52"      # bay protection relay (GOOSE/SV sub)
 
 def build():
     out = []
@@ -643,6 +679,9 @@ def build():
     na, ns = ndp_frames()
     out.append(na)
     out.append(ns)
+    # IEC 61850: GOOSE publish from the bay IED + SV stream from the merging unit
+    out.append(goose_frame())
+    out.append(sv_frame())
     out.append(pn_dcp_identify_response())
     out.append(pn_rt_data("scada", "plc_s7"))
     out.append(pn_rt_data("scada", "plc_ab"))

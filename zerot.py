@@ -234,6 +234,7 @@ class Scope:
 # --------------------------------------------------------------------------
 
 OT_PROTOCOLS = {"modbus", "s7comm", "enip", "dnp3", "iec104", "opcua", "bacnet", "profinet_dcp", "profinet_rt"}
+OT_PROTOCOLS |= {"goose", "sv"}          # IEC 61850 layer-2
 IOT_PROTOCOLS = {"mdns", "ssdp", "mqtt", "knxnet_ip"}
 IOT_ROLES = {"iot_device", "mqtt_client", "knx_client", "mdns_querier"}
 OT_ZONES = {"L1", "L2", "L3", "L2_L3"}
@@ -629,6 +630,10 @@ class Model:
             return self._on_profinet(src_mac, dst_mac, payload, ts)
         if pkt.haslayer(ARP):
             return self._on_arp(pkt[ARP], ts)
+        if etype == 0x88B8:               # GOOSE
+            return self._on_goose(src_mac, dst_mac, payload, ts)
+        if etype == 0x88BA:               # Sampled Values
+            return self._on_sv(src_mac, dst_mac, payload, ts)
 
         from scapy.all import ICMPv6ND_NS as _NDNS, ICMPv6ND_NA as _NDNA
         if pkt.haslayer(_NDNS):
@@ -1292,6 +1297,86 @@ class Model:
             a.roles.add("gateway")
         return True
 
+    # --- IEC 61850 layer-2 (GOOSE / Sampled Values) ----------------------------
+    # GOOSE and SV are ethertype-protocol L2 traffic: no IP, no ports. Identity
+    # is the MAC; GOOSE self-describes (device name, dataset reference) in
+    # ASN.1 BER. Publishers re-announce continuously, so one frame names the
+    # publisher and what it publishes.
+
+    def _on_goose(self, src_mac: str, dst_mac: str, payload: bytes, ts: str) -> bool:
+        """IEC 61850 GOOSE (ethertype 0x88B8). Extracts goID (device name),
+        datSet (dataset reference) and stNum from the ASN.1 BER APDU. Publishers
+        re-announce continuously, so one frame = one living IED."""
+        if len(payload) < 8:
+            return False
+        s = self.resolve(mac=src_mac)
+        d = self.resolve(mac=dst_mac)
+        s.touch(ts); d.touch(ts)
+        s.protocols.add("goose")
+        # header: appid(2) length(2) reserved1(2) reserved2(2) then BER APDU
+        apdu = payload[8:]
+        # BER walk: sequence of [tag, len, value]; tags are context classes
+        i, n = 0, len(apdu)
+        goid = datset = ""
+        stnum = None
+        while i + 2 <= n:
+            tag = apdu[i]
+            l = apdu[i + 1]
+            hoff = 2
+            if l & 0x80:
+                nl = l & 0x7F
+                if nl == 0 or nl > 4 or i + 2 + nl > n:
+                    break
+                l = int.from_bytes(apdu[i + 2:i + 2 + nl], "big")
+                hoff = 2 + nl
+            if i + hoff + l > n:
+                break
+            val = apdu[i + hoff:i + hoff + l]
+            i += hoff + l
+            if tag == 0x81 and l >= 2:                    # goID (context 1, implicit)
+                goid = val.decode("latin1", "replace").strip()
+            elif tag == 0x82 and l >= 2:                  # datSet (context 2)
+                datset = val.decode("latin1", "replace").strip()
+            elif tag == 0x85 and l >= 1:                  # stNum (context 5)
+                stnum = int.from_bytes(val, "big")
+        if goid:
+            s.hostnames.add(goid)
+            s.attrs["goose_goid"] = goid
+        if datset:
+            s.attrs["goose_datset"] = datset
+        if stnum is not None:
+            s.attrs["goose_stnum"] = stnum
+        s.roles.add("goose_publisher")
+        d.roles.add("goose_subscriber")
+        e = self.edge(s.id, d.id, "goose")
+        e.touch(ts)
+        return True
+
+    def _on_sv(self, src_mac: str, dst_mac: str, payload: bytes, ts: str) -> bool:
+        """IEC 61850-9-2 Sampled Values (ethertype 0x88BA). Merging units
+        stream CT/VT samples to subscribed relays at 4kHz — L2, IP-less. We
+        record publisher/subscriber MACs and the nAstndDat (samples/PDU)."""
+        if len(payload) < 8:
+            return False
+        s = self.resolve(mac=src_mac)
+        d = self.resolve(mac=dst_mac)
+        s.touch(ts); d.touch(ts)
+        s.protocols.add("sv")
+        # savPDU = [60 len] { noASDU [80 1 val], seqASDU } — lenient walk
+        noASDU = 1
+        if len(payload) > 11 and payload[8] == 0x60:
+            i = 10                      # skip seq tag + short-form length
+            if payload[9] & 0x80:       # long-form length: skip its bytes
+                i = 10 + (payload[9] & 0x7F)
+            if payload[i] == 0x80 and payload[i + 1] == 1:
+                noASDU = payload[i + 2]
+        s.attrs["sv_noasdu"] = noASDU
+        s.roles.add("sv_publisher")
+        d.roles.add("sv_subscriber")
+        e = self.edge(s.id, d.id, "sv")
+        e.touch(ts)
+        return True
+
     def _on_profinet(self, src_mac: str, dst_mac: str, payload: bytes, ts: str) -> bool:
         if len(payload) < 4:
             return False
@@ -1440,6 +1525,38 @@ class Model:
                 paths.append({"from": s.id, "to": t, "hops": hops, "depth": len(hops)})
         paths.sort(key=lambda p: p["depth"])
         return paths
+
+    def timeline(self, limit: int = 500) -> list[dict]:
+        """Unified chronological activity feed: asset first/last sightings,
+        conversation first frames, and findings (keyed to their evidence ts).
+        Powers /api/timeline and the UI activity panel."""
+        items = []
+        for a in self.assets.values():
+            if a.first_seen:
+                items.append({"ts": a.first_seen, "kind": "asset_first",
+                              "id": a.id, "label": a.label, "zone": a.zone(self.scope)})
+            if a.last_seen and a.last_seen != a.first_seen:
+                items.append({"ts": a.last_seen, "kind": "asset_last",
+                              "id": a.id, "label": a.label, "zone": a.zone(self.scope)})
+        for e in self.edges.values():
+            if e.first_seen:
+                src = self.assets.get(e.src)
+                dst = self.assets.get(e.dst)
+                items.append({"ts": e.first_seen, "kind": "conv_first",
+                              "id": f"{e.src}->{e.dst}", "proto": e.proto,
+                              "label": f"{src.label if src else e.src} → {dst.label if dst else e.dst}",
+                              "writes": e.writes, "exceptions": e.exceptions})
+        for f in self.findings:
+            ev_ts = ""
+            for ev in f.get("evidence", {}).get("provenance", []):
+                if ev.get("ts"):
+                    ev_ts = ev["ts"]
+                    break
+            if ev_ts:
+                items.append({"ts": ev_ts, "kind": "finding", "id": f.get("id"),
+                              "label": f.get("title", ""), "severity": f.get("severity")})
+        items.sort(key=lambda x: x["ts"])
+        return items[-limit:]
 
     def next_crawl_targets(self) -> list[dict]:
         """Where the next discovery round should look, based on what the graph
@@ -1958,7 +2075,7 @@ class Model:
 
 # Registry: ONLY read-only discovery techniques exist. Write-class probes are
 # deliberately not implemented; requesting an unknown technique is a hard block.
-ACTIVE_TECHNIQUES = {"arp_ping", "tcp_probe", "modbus_id", "enip_list", "mdns_query", "ssdp_msearch", "modbus_unit_sweep", "bacnet_whois", "s7_szl"}
+ACTIVE_TECHNIQUES = {"arp_ping", "tcp_probe", "modbus_id", "enip_list", "mdns_query", "ssdp_msearch", "modbus_unit_sweep", "bacnet_whois", "s7_szl", "snmp_sysdesc"}
 
 
 class ActivePlanner:
@@ -2193,6 +2310,44 @@ def _probe_ssdp(ip: str, model: Model):
     return {"ip": ip, "upnp_server": a.attrs.get("upnp_server", "?")}
 
 
+def _probe_snmp_sysdesc(ip: str, model: Model, community: str = "public",
+                        port: int = 161, timeout: float = 1.5):
+    """SNMP v1 GET for the system group (sysDescr/sysName/sysLocation/
+    sysContact). One UDP request-response, read-only — the classic NMS poll.
+    The response is folded through the passive dissector so passive and active
+    paths produce identical attrs."""
+    def oid_bytes(o):
+        return bytes([int(o.split(".")[0]) * 40 + int(o.split(".")[1])]) + b"".join(
+            bytes([int(p)]) for p in o.split(".")[2:])
+
+    def tlv(tag, val):
+        if len(val) < 0x80:
+            return bytes([tag, len(val)]) + val
+        lb = len(val).to_bytes((len(val).bit_length() + 7) // 8, "big")
+        return bytes([tag, 0x80 | len(lb)]) + lb + val
+
+    oids = ["1.3.6.1.2.1.1.1.0", "1.3.6.1.2.1.1.5.0", "1.3.6.1.2.1.1.6.0", "1.3.6.1.2.1.1.4.0"]
+    vbs = b"".join(tlv(0x30, tlv(0x06, oid_bytes(o)) + tlv(0x05, b"")) for o in oids)
+    pdu = tlv(0xA0, tlv(0x02, b"\x01") + tlv(0x02, b"\x00") + tlv(0x02, b"\x00") + tlv(0x30, vbs))
+    msg = tlv(0x30, tlv(0x02, b"\x00") + tlv(0x04, community.encode()) + pdu)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.sendto(msg, (ip, port))
+        data, _ = s.recvfrom(4096)
+    except (socket.timeout, OSError):
+        return None
+    finally:
+        s.close()
+    a = model.resolve(ip=ip)
+    a.touch(now_iso())
+    model._on_snmp(ip, ip, 161, 161, data, now_iso())
+    return {"ip": ip,
+            "sysDescr": a.attrs.get("snmp_sysDescr", ""),
+            "sysName": a.attrs.get("snmp_sysName", ""),
+            "community": community}
+
+
 def _probe_s7_szl(ip: str, model: Model, port: int = 102, timeout: float = 2.5):
     """Identify a Siemens S7 PLC via Read SZL (byte nmap s7-info):
     COTP CR + S7 setup, then SZL 0x0011 (module/basic-hardware) and 0x001C
@@ -2304,7 +2459,8 @@ _ACTIVE_RUNNERS = {"arp_ping": _probe_arp, "tcp_probe": _probe_tcp,
                    "mdns_query": _probe_mdns, "ssdp_msearch": _probe_ssdp,
                    "modbus_unit_sweep": _probe_modbus_unit_sweep,
                    "bacnet_whois": _probe_bacnet_whois,
-                   "s7_szl": _probe_s7_szl}
+                   "s7_szl": _probe_s7_szl,
+                   "snmp_sysdesc": _probe_snmp_sysdesc}
 
 # --------------------------------------------------------------------------
 # Flask app
@@ -2347,6 +2503,11 @@ def create_app(model: Model):
     def events():
         with state["lock"]:
             return jsonify(state["model"].events[-200:])
+
+    @app.get("/api/timeline")
+    def timeline():
+        with state["lock"]:
+            return jsonify({"items": state["model"].timeline()})
 
     @app.post("/api/pcap")
     def import_pcap():
@@ -2492,6 +2653,13 @@ def main(argv=None):
     p = sub.add_parser("stale", help="list assets not seen on the wire for N days")
     p.add_argument("--db", default=str(ROOT / "data" / "zerot_state.json"))
     p.add_argument("--days", type=float, default=7.0, help="idle threshold in days")
+    p = sub.add_parser("watch", help="ingest, diff against baseline state, report NEW findings/assets; cron-able")
+    p.add_argument("pcaps", nargs="+", help="pcap(s) to fold into state before diffing")
+    p.add_argument("--db", default=str(ROOT / "data" / "zerot_state.json"), help="live state (baseline + new)")
+    p.add_argument("--scope", default=None)
+    p.add_argument("--baseline", default=None, help="baseline state json (default: copy of db before this run)")
+    p.add_argument("--min-sev", choices=["info", "medium", "high"], default="info")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
 
     p = sub.add_parser("export", help="export graph/assets from a saved state")
     p.add_argument("--db", default=str(ROOT / "data" / "zerot_state.json"))
@@ -2710,6 +2878,44 @@ def main(argv=None):
             roles = ",".join(sorted(a.roles)[:3]) or "-"
             print(f"  {idle:7.1f}d  {a.label:<34} {z:<14} {roles}")
         print("[i] staleness = last_seen on the wire; verify before declaring decommissioned")
+
+    elif args.cmd == "watch":
+        # cron-able drift alert: fold new captures into the live state, diff
+        # against the baseline, report NEW findings/assets at >= min-sev.
+        scope = Scope.load(args.scope) if args.scope else Scope()
+        db = Path(args.db)
+        baseline = Path(args.baseline) if args.baseline else db.with_suffix(".baseline.json")
+        if db.exists():
+            base_model = Model.load(db)
+        else:
+            base_model = Model(scope)          # first run: everything is new
+        base_model.save(baseline)
+        model = Model.load(baseline)
+        model.scope = scope
+        for pcap in args.pcaps:
+            model.ingest_pcap(pcap)
+        model.save(db)
+        SEV_RANK = {"info": 0, "medium": 1, "high": 2}
+        floor = SEV_RANK[args.min_sev]
+        d = diff_models(base_model, model)
+        alerts = {"new_findings": [f for f in d["new_findings"]
+                                   if SEV_RANK.get(f.get("severity", "info"), 0) >= floor],
+                  "new_assets": d["new_assets"]}
+        if args.json:
+            print(json.dumps(alerts, indent=1))
+        else:
+            nf, na = alerts["new_findings"], alerts["new_assets"]
+            print(f"[watch] {len(nf)} new finding(s), {len(na)} new asset(s) since baseline")
+            for f in nf:
+                print(f"  [{f.get('severity', '?').upper():<6}] {f.get('title', f.get('id'))}")
+            for a in na:
+                print(f"  [ASSET] {a.get('label', a.get('id'))} ({a.get('vendor') or '?'}, {a.get('zone', '?')})")
+        rc = 0
+        if alerts["new_findings"]:
+            rc = 2        # cron convention: findings need attention
+        elif alerts["new_assets"]:
+            rc = 1        # new devices on an OT network deserve a look
+        return rc
 
     elif args.cmd == "serve":
         db = Path(args.db)
