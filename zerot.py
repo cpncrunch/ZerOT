@@ -3,13 +3,18 @@
 
 Architecture (single-file, ZerOT pattern):
   - Model: asset/edge/finding store, MAC<->IP merge, OUI vendor enrichment
-  - Passive dissectors: modbus, s7comm, enip, dnp3, opcua, bacnet, lldp,
-    profinet dcp/rt, nbns, dhcp, arp
+  - Passive dissectors: modbus, s7comm, enip, dnp3, iec104, opcua, bacnet,
+    goose/sv (IEC 61850), lldp, cdp, profinet dcp/rt, nbns, dhcp, arp,
+    mdns, ssdp, mqtt, knx, snmp, ndp; TLS SNI; 802.1Q untagging
   - Zones/Purdue inference from scope config; role inference from protocol behavior
-  - Findings engine: unmanaged devices, rogue masters, enterprise->control paths, writes
-  - Gated active layer: arp_ping / tcp_probe / modbus_id / enip_list
-    (allow|confirm|block per technique, dry-run default, --execute required,
-     write-class probes NOT IMPLEMENTED by design)
+  - Findings engine: unmanaged devices, rogue masters, enterprise->control paths,
+    writes, IoT-on-OT; offline product->CVE enrichment (NVD-sourced db)
+  - Gated active layer (allow|confirm|block per technique, dry-run default,
+    --execute required, write-class probes NOT IMPLEMENTED by design):
+    arp_ping, tcp_probe, modbus_id, modbus_unit_sweep, enip_list,
+    mdns_query, ssdp_msearch, bacnet_whois, s7_szl, snmp_sysdesc
+  - Evidence provenance: source file + frame number per asset/edge/finding
+  - Timeline (/api/timeline) and drift tooling: diff, stale, watch (cron-able)
   - Exports: graphviz dot (+svg/png), csv, markdown report, json state
   - Flask API + vendored-d3 single-file UI (air-gap friendly)
 
