@@ -10,10 +10,10 @@ air-gap capable (d3 vendored, OUI database bundled, zero external calls).
 
 ![ZerOT graph view — synthetic demo plant](docs/screenshot.png)
 
-*The demo plant from `tests/fixtures/ot_plant.pcap`: 25 assets across Purdue
-zones, with virtual child PLCs behind the Modbus gateway and DNP3
-concentrator. [Attack-paths view](docs/screenshot_paths.png) highlights
-enterprise→PLC traversal.*
+*The demo plant from `tests/fixtures/ot_plant.pcap`: 30 assets across Purdue
+zones (27 discovered + 3 virtual child PLCs/RTUs behind the Modbus gateway
+and DNP3 concentrator). [Attack-paths view](docs/screenshot_paths.png)
+highlights enterprise→PLC traversal.*
 
 ## What it detects
 
@@ -55,7 +55,7 @@ pip install .
 ## Quick start (synthetic demo plant)
 
 ```
-# regenerate the 54-packet known-answer fixture
+# regenerate the 76-packet known-answer fixture
 python3 scripts/gen_ot_pcap.py
 
 # passive ingest with Purdue zoning
@@ -191,10 +191,10 @@ the previous round learned. It stops when no new targets appear.
 - `block`   — never runs (also: active disabled ⇒ everything blocked)
 
 **Write-class probes do not exist in this tool.** The technique registry is a
-closed set of read-only discovery methods (`arp_ping`, `tcp_probe`, `modbus_id`,
-`enip_list`, `mdns_query`, `ssdp_msearch`,
-`modbus_unit_sweep`, `bacnet_whois`, `s7_szl`, `snmp_sysdesc`); unknown technique names are hard
-blocked at execution time.
+closed set of read-only discovery methods — `arp_ping`, `tcp_probe`,
+`modbus_id`, `enip_list`, `mdns_query`, `ssdp_msearch`,
+`modbus_unit_sweep`, `bacnet_whois`, `s7_szl`, `snmp_sysdesc` — and unknown
+technique names are hard blocked at execution time.
 
 ## API (serve mode)
 
