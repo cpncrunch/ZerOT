@@ -8,3 +8,4 @@ data/*.local.json
 *.svg
 *.png
 .pytest_cache/
+!docs/*.png

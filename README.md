@@ -8,6 +8,13 @@ live sniffing, with a strictly gated, read-only active layer.
 Single-file Python backend + single-file d3 UI. No build step. Fully
 air-gap capable (d3 vendored, OUI database bundled, zero external calls).
 
+![ZerOT graph view — synthetic demo plant](docs/screenshot.png)
+
+*The demo plant from `tests/fixtures/ot_plant.pcap`: 25 assets across Purdue
+zones, with virtual child PLCs behind the Modbus gateway and DNP3
+concentrator. [Attack-paths view](docs/screenshot_paths.png) highlights
+enterprise→PLC traversal.*
+
 ## What it detects
 
 | Layer | Source | Output |
