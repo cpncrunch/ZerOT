@@ -78,6 +78,83 @@ CONSUMER_VENDOR_PREFIXES = (
     "Shenzhen", "TP-Link", "Ring", "Amazon Technologies", "Roku", "Sonos",
 )
 
+def _ber_read_tlv(buf: bytes, off: int = 0):
+    """BER TLV at offset -> (tag, value, next_offset) or None."""
+    if off + 2 > len(buf):
+        return None
+    tag = buf[off]
+    l = buf[off + 1]
+    hoff = 2
+    if l & 0x80:                     # long-form length
+        nlen = l & 0x7F
+        if nlen == 0 or nlen > 4 or off + 2 + nlen > len(buf):
+            return None
+        l = int.from_bytes(buf[off + 2:off + 2 + nlen], "big")
+        hoff = 2 + nlen
+    if off + hoff + l > len(buf):
+        return None
+    return tag, buf[off + hoff:off + hoff + l], off + hoff + l
+
+
+def _snmp_parse(raw: bytes):
+    """SNMP v1/v2c message -> (version, community, pdu_tag, pdu_bytes) or None."""
+    m = _ber_read_tlv(raw)
+    if m is None or m[0] != 0x30:
+        return None
+    body = m[1]
+    v = _ber_read_tlv(body)                      # version INTEGER
+    if v is None or v[0] != 0x02 or len(v[1]) < 1:
+        return None
+    version = v[1][0]
+    c = _ber_read_tlv(body, v[2])                # community OCTET STRING
+    if c is None or c[0] != 0x04:
+        return None
+    community = c[1].decode("latin1", "replace")
+    if version == 3:
+        return version, community, None, None
+    p = _ber_read_tlv(body, c[2])                # PDU
+    if p is None:
+        return version, community, None, None
+    return version, community, p[0], p[1]
+
+
+def _snmp_vbl(pdu: bytes) -> bytes | None:
+    """Varbind list from a PDU: skip request-id, error-status, error-index
+    (each a BER TLV), then the SEQUENCE OF pairs."""
+    off = 0
+    for _ in range(3):
+        t = _ber_read_tlv(pdu, off)
+        if t is None:
+            return None
+        off = t[2]
+    v = _ber_read_tlv(pdu, off)
+    if v is None or v[0] != 0x30:
+        return None
+    return v[1]
+
+
+def _ber_tlv(buf: bytes):
+    """BER TLV at 0 -> (tag, value, rest_after_tlv). Tolerant shorthand."""
+    t = _ber_read_tlv(buf)
+    if t is None:
+        return None, None, None
+    return t[0], t[1], buf[t[2]:]
+
+
+def _oid_decode(data: bytes) -> str:
+    """BER OID value bytes -> dotted string (first two subids compressed)."""
+    if not data:
+        return ""
+    parts = [str(data[0] // 40), str(data[0] % 40)]
+    val = 0
+    for b in data[1:]:
+        val = (val << 7) | (b & 0x7F)
+        if not b & 0x80:
+            parts.append(str(val))
+            val = 0
+    return ".".join(parts)
+
+
 def mac_vendor(mac: str) -> str:
     if not mac:
         return ""
@@ -295,6 +372,28 @@ class Model:
         # ingestion harness; dissectors record it onto assets/edges
         self.pkt_ctx: dict = {}
 
+    def _crosses_boundary(self, ip: str, others) -> bool:
+        """Router-guard test: does `ip` sit on the other side of a known
+        segmentation line from every IP in `others`? Boundary = the scope's
+        zone and excluded networks. With no scope nets, fall back to the /24
+        heuristic (capture-only deployments)."""
+        if self.scope.zone_nets:
+            try:
+                a = ip_address(ip)
+            except ValueError:
+                return False
+            for o in others:
+                try:
+                    b = ip_address(o)
+                except ValueError:
+                    continue
+                if a.version != b.version:
+                    continue
+                if not any((a in n) == (b in n) for n, _z in self.scope.zone_nets):
+                    return True
+            return False
+        return not any(_same24(ip, o) for o in others)
+
     def _ev(self, obj, detail: str = "", force=False):
         """Record current packet context as evidence on an asset or edge.
         Capped: keeps the first and latest few references per object."""
@@ -334,7 +433,7 @@ class Model:
                 # DIFFERENT /24 is a last-hop router for routed traffic, not this
                 # host. Keep the ip-keyed identity and note the route instead.
                 infra = existing.roles & {"router", "switch", "gateway"}
-                if infra or (existing.ips and not any(_same24(ip, o) for o in existing.ips)):
+                if infra or (existing.ips and self._crosses_boundary(ip, existing.ips)):
                     a = self.resolve(ip=ip)
                     a.attrs.setdefault("last_hop_router", mac)
                     return a
@@ -416,6 +515,24 @@ class Model:
         self.log("ingest", f"live batch: {n} packets processed")
         return n
 
+    @staticmethod
+    def _unshim(pkt):
+        """Normalize 802.1Q (and QinQ) frames -> (effective_ethertype, payload,
+        vlan_id|None). SPAN/mirror captures usually carry tags; without this the
+        ethertype-dispatched dissectors (LLDP, PROFINET, CDP) go blind because
+        the outer ethertype reads 0x8100."""
+        from scapy.all import Ether as Ether_cls
+        eth = pkt.getlayer(Ether_cls)
+        if eth is None:
+            return None, None, None
+        etype, payload, vlan = eth.type, bytes(eth.payload), None
+        while etype == 0x8100 and len(payload) >= 4:
+            tci = struct.unpack(">H", payload[0:2])[0]
+            vlan = tci & 0x0FFF
+            etype = struct.unpack(">H", payload[2:4])[0]
+            payload = payload[4:]
+        return etype, payload, vlan
+
     def _ingest_batch(self, pkts, source: str = "unknown") -> int:
         """Unified two-pass pipeline used by BOTH pcap and live ingestion:
         pass 1 (identity) is ordered so infrastructure is known before hosts:
@@ -432,19 +549,28 @@ class Model:
         for i, pkt in enumerate(pkts):
             eth = pkt.getlayer(Ether_cls)
             self.pkt_ctx = {"source": source, "frame": i + 1, "ts": ts_of(pkt)}
-            if eth is not None and eth.type == 0x88CC:
+            if eth is None:
+                continue
+            etype, vpayload, vlan = self._unshim(pkt)
+            if etype == 0x88CC:
                 try:
-                    self._on_lldp(eth.src, bytes(eth.payload), ts_of(pkt))
+                    self._on_lldp(eth.src, vpayload, ts_of(pkt), vlan=vlan)
+                except Exception:
+                    continue
+            elif etype == 0x2000:
+                try:
+                    self._on_cdp(eth.src, vpayload, ts_of(pkt), vlan=vlan)
                 except Exception:
                     continue
         for i, pkt in enumerate(pkts):
             self.pkt_ctx = {"source": source, "frame": i + 1, "ts": ts_of(pkt)}
             try:
                 eth = pkt.getlayer(Ether_cls)
+                etype, vpayload, _vlan = self._unshim(pkt)
                 if pkt.haslayer(ARP_cls):
                     self._on_arp(pkt[ARP_cls], ts_of(pkt))
-                elif eth is not None and eth.type == 0x8892:
-                    self._on_profinet(eth.src, eth.dst, bytes(eth.payload), ts_of(pkt))
+                elif eth is not None and etype == 0x8892:
+                    self._on_profinet(eth.src, eth.dst, vpayload, ts_of(pkt))
             except Exception:
                 continue
         for i, pkt in enumerate(pkts):
@@ -504,6 +630,12 @@ class Model:
         if pkt.haslayer(ARP):
             return self._on_arp(pkt[ARP], ts)
 
+        from scapy.all import ICMPv6ND_NS as _NDNS, ICMPv6ND_NA as _NDNA
+        if pkt.haslayer(_NDNS):
+            return self._on_ndp_ns(pkt, ts)
+        if pkt.haslayer(_NDNA):
+            return self._on_ndp_na(pkt, ts)
+
         if not pkt.haslayer(IP):
             return False
         ip = pkt[IP]
@@ -546,6 +678,8 @@ class Model:
                 return self._on_iec104(sip, dip, sp, dp, raw, ts)
             if dp == 4840 or sp == 4840:
                 return self._on_opcua(sip, dip, sp, dp, raw, ts)
+            if raw[:1] == b"\x16":
+                return self._on_tls_clienthello(sip, dip, sp, dp, raw, ts)
             return False
         if pkt.haslayer(UDP):
             udp = pkt[UDP]
@@ -563,9 +697,64 @@ class Model:
                 return self._on_ssdp(sip, raw, ts)
             if dp == 3671 or sp == 3671:
                 return self._on_knx(sip, raw, ts)
+            if dp == 161 or sp == 161:
+                return self._on_snmp(sip, dip, sp, dp, raw, ts)
         return False
 
     # -- dissectors ------------------------------------------------------------
+
+    def resolve6(self, ip6: str, pkt) -> Asset:
+        """IPv6 identity. The source link-layer address OPTION inside NDP is
+        authoritative even on multicast-eth frames. NDP is never routed, so a
+        unicast-eth source MAC is also the speaker's own NIC."""
+        from scapy.all import Ether as Ether_cls, ICMPv6NDOptSrcLLAddr as _SLLA
+        slla = None
+        for opt in (pkt.getlayer(_SLLA), ):
+            if opt is not None:
+                slla = str(opt.lladdr).upper()
+                break
+        eth = pkt.getlayer(Ether_cls)
+        mac = slla or (str(eth.src).upper() if eth is not None else "")
+        if mac and mac != "FF:FF:FF:FF:FF:FF":
+            a = self.resolve(mac=mac)
+            lst = a.attrs.get("ip6s") or []
+            if ip6 not in lst:
+                lst.append(ip6)
+            a.attrs["ip6s"] = lst
+            return a
+        return self.resolve(ip=ip6)
+
+    def _on_ndp_ns(self, pkt, ts: str) -> bool:
+        """Neighbor Solicitation: a non-multicast, non-unspecified source is a
+        live IPv6 host announcing an address (SLLA option carries the MAC)."""
+        from scapy.all import IPv6 as IPv6_cls
+        ip6 = pkt.getlayer(IPv6_cls)
+        if ip6 is None:
+            return False
+        src = str(ip6.src)
+        if src == "::" or src.startswith("ff"):
+            return False
+        a = self.resolve6(src, pkt)
+        a.touch(ts)
+        a.protocols.add("ndp")
+        self._ev(a, f"NDP NS {src}")
+        return True
+
+    def _on_ndp_na(self, pkt, ts: str) -> bool:
+        """Neighbor Advertisement: authoritative MAC<->IPv6 binding (the ARP
+        equivalent for dual-stack plants)."""
+        from scapy.all import IPv6 as IPv6_cls
+        ip6 = pkt.getlayer(IPv6_cls)
+        if ip6 is None:
+            return False
+        src = str(ip6.src)
+        if src == "::" or src.startswith("ff"):
+            return False
+        a = self.resolve6(src, pkt)
+        a.touch(ts)
+        a.protocols.add("ndp")
+        self._ev(a, f"NDP NA {src}")
+        return True
 
     # --- smart-building / IoT -------------------------------------------------
     def _read_dns_name(self, raw: bytes, off: int) -> tuple[str, int]:
@@ -887,6 +1076,104 @@ class Model:
         server.roles.add("opcua_server")
         return True
 
+    def _on_tls_clienthello(self, sip, dip, sp, dp, raw, ts) -> bool:
+        """Passive TLS ClientHello SNI extraction — names HTTPS HMIs, TLS-MQTT
+        and anything else encrypted. Metadata only; no decryption."""
+        try:
+            if len(raw) < 46 or raw[0] != 0x16:
+                return False
+            # rec(5) hs-hdr(4) ver(2) random(32) -> sid-len at 43
+            off = 44 + raw[43]
+            cslen = struct.unpack(">H", raw[off:off + 2])[0]
+            off += 2 + cslen
+            off += 1 + raw[off]                       # compression methods
+            ext_total = struct.unpack(">H", raw[off:off + 2])[0]
+            end = off + 2 + ext_total
+            off += 2
+            while off + 4 <= end and off + 4 <= len(raw):
+                etype, elen = struct.unpack(">HH", raw[off:off + 4])
+                if etype == 0:                        # server_name extension
+                    # data: list_len(2) name_type(1) name_len(2) name
+                    listing = off + 4 + 2
+                    if listing + 3 > len(raw):
+                        break
+                    nlen = struct.unpack(">H", raw[listing + 1:listing + 3])[0]
+                    sni = raw[listing + 3:listing + 3 + nlen].decode("utf-8", "replace")
+                    if sni:
+                        src = self.resolve(ip=sip)
+                        src.attrs["tls_sni"] = sni
+                        src.protocols.add("tls")
+                        src.touch(ts)
+                        self._ev(src, f"TLS SNI {sni}")
+                        return True
+                    break
+                off += 4 + elen
+        except (struct.error, IndexError):
+            return False
+        return False
+
+    def _on_snmp(self, sip, dip, sp, dp, raw, ts) -> bool:
+        """Passive SNMP v1/v2c: community strings in the clear, plus sysDescr/
+        sysName/sysLocation from GET responses — often the richest identity
+        source on switches, RTUs and gateways. SNMPv3 is logged, not parsed."""
+        if len(raw) < 10:
+            return False
+        a = self.resolve(ip=sip)
+        a.protocols.add("snmp")
+        a.touch(ts)
+        self._ev(a, "snmp")
+        parsed = _snmp_parse(raw)
+        if parsed is None:
+            return True
+        version, community, pdu_tag, pdu = parsed
+        if version == 3:
+            a.attrs["snmpv3"] = True
+            return True
+        if community:
+            a.attrs["snmp_community"] = community
+        if dp == 161:
+            a.roles.add("snmp_manager")
+        else:
+            a.roles.add("snmp_agent")
+        if pdu_tag in (0xA0, 0xA2):                   # get / get-response
+            vb = _snmp_vbl(pdu)
+            if vb:
+                self._snmp_vb_walk(vb, a)
+        return True
+
+    def _snmp_vb_walk(self, vb: bytes, a) -> None:
+        i, n = 0, len(vb)
+        while i + 2 <= n:
+            seq_t, seq_l = vb[i], vb[i + 1]
+            if seq_t != 0x30 or i + 2 + seq_l > n:
+                break
+            pair = vb[i + 2:i + 2 + seq_l]
+            i += 2 + seq_l
+            oid_t, oid_val, rest2 = _ber_tlv(pair)
+            if oid_t != 0x06:
+                continue
+            oid = _oid_decode(oid_val)
+            vt, vval, _ = _ber_tlv(rest2)
+            if vt == 0x04:                            # OCTET STRING
+                self._snmp_apply(a, oid, vval.decode("latin1", "replace").strip())
+            elif vt == 0x02:                          # INTEGER
+                self._snmp_apply(a, oid, int.from_bytes(vval, "big"))
+
+    def _snmp_apply(self, a, oid: str, value) -> None:
+        SNMP_SYS = {"1": "sysDescr", "4": "sysContact", "5": "sysName", "6": "sysLocation"}
+        if not oid.startswith("1.3.6.1.2.1.1.") or value in (None, ""):
+            return
+        parts = oid.split(".")
+        # sys OIDs carry an instance arc (sysDescr.0); the field is the arc before it
+        field_arc = parts[-2] if parts[-1] == "0" else parts[-1]
+        key = SNMP_SYS.get(field_arc)
+        if key is None:
+            return
+        a.attrs[f"snmp_{key}"] = value
+        if key == "sysName":
+            a.hostnames.add(value)
+        self._ev(a, f"snmp {key}")
+
     def _on_bacnet(self, sip, dip, sp, dp, raw, ts) -> bool:
         if len(raw) < 8 or raw[0] != 0x81:
             return False
@@ -911,10 +1198,12 @@ class Model:
                 src_asset.attrs["bacnet_instance"] = objid & 0x3FFFFF
         return True
 
-    def _on_lldp(self, src_mac: str, payload: bytes, ts: str) -> bool:
+    def _on_lldp(self, src_mac: str, payload: bytes, ts: str, vlan: int | None = None) -> bool:
         a = self.resolve(mac=src_mac)
         a.touch(ts)
         a.protocols.add("lldp")
+        if vlan is not None:
+            a.attrs["vlan"] = vlan
         i, n = 0, len(payload)
         caps = 0
         while i + 2 <= n:
@@ -943,6 +1232,64 @@ class Model:
             a.roles.add("switch")
         if caps & 0x20:
             a.roles.add("voip_phone")   # telephone bit
+        return True
+    def _on_cdp(self, src_mac: str, payload: bytes, ts: str, vlan: int | None = None) -> bool:
+        """Cisco Discovery Protocol (ethertype 0x2000). DeviceID, software,
+        IPv4 addresses, native VLAN, capabilities. CDP is never forwarded by a
+        switch, so a CDP frame names the Cisco device itself — same trust level
+        as LLDP in pass 1a."""
+        if len(payload) < 8 or payload[0] != 0x02:
+            return False
+        a = self.resolve(mac=src_mac)
+        a.touch(ts)
+        a.protocols.add("cdp")
+        if vlan is not None:
+            a.attrs["vlan"] = vlan
+        i, n = 4, len(payload)
+        caps = 0
+        while i + 4 <= n:
+            t, l = struct.unpack(">HH", payload[i:i + 4])
+            if l == 0 or i + 4 + l > n:
+                break
+            val = payload[i + 4:i + 4 + l]
+            i += 4 + l
+            if t == 0x01:                               # Device ID
+                name = val.decode("latin1", "replace").strip()
+                if name:
+                    a.hostnames.add(name)
+                    a.attrs["cdp_devid"] = name
+            elif t == 0x03:                             # Version / software
+                a.attrs["cdp_software"] = val.decode("latin1", "replace").strip()
+            elif t == 0x0A and len(val) >= 2:           # native VLAN
+                a.attrs["vlan"] = struct.unpack(">H", val[0:2])[0]
+            elif t == 0x11 and len(val) >= 4:           # capabilities
+                caps = struct.unpack(">I", val[-4:])[0]
+            elif t == 0x16 and len(val) >= 8:           # addresses
+                try:
+                    count = struct.unpack(">I", val[0:4])[0]
+                    j = 4
+                    for _ in range(min(count, 4)):
+                        if j + 1 > len(val):
+                            break
+                        plen = val[j]
+                        if j + 1 + plen + 2 > len(val):
+                            break
+                        proto = val[j + 1:j + 1 + plen]
+                        alen = struct.unpack(">H", val[j + 1 + plen:j + 3 + plen])[0]
+                        if j + 3 + plen + alen > len(val):
+                            break
+                        if proto == b"\xcc" and alen == 4:      # IPv4
+                            ipaddr = str(ip_address(val[j + 3 + plen:j + 7 + plen]))
+                            a.ips.add(ipaddr)
+                            self._ip_alias[ipaddr] = a.id
+                        j += 3 + plen + alen
+                except (struct.error, IndexError):
+                    pass
+        if caps & 0x08:
+            a.roles.add("switch")
+        if caps & 0x10:
+            a.roles.add("router")
+            a.roles.add("gateway")
         return True
 
     def _on_profinet(self, src_mac: str, dst_mac: str, payload: bytes, ts: str) -> bool:
@@ -1702,12 +2049,23 @@ def _probe_arp(ip: str, model: Model):
 
 def _probe_tcp(ip: str, model: Model, ports=(502, 102, 44818, 20000, 4840, 22, 23, 80, 443)):
     open_ports = []
+    banners = {}
     for p in ports:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(1.2)
         try:
             s.connect((ip, p))
             open_ports.append(p)
+            if p in (21, 22, 23, 80):            # banner-friendly services
+                try:
+                    s.settimeout(1.5)
+                    banner = s.recv(128)
+                    if banner:
+                        # service greetings often start with CRLF; first
+                        # non-empty line is the banner proper
+                        banners[p] = banner.strip().split(b"\r\n")[0].decode("latin1", "replace").strip()[:96]
+                except (socket.timeout, OSError):
+                    pass
         except (socket.timeout, OSError):
             pass
         finally:
@@ -1716,7 +2074,12 @@ def _probe_tcp(ip: str, model: Model, ports=(502, 102, 44818, 20000, 4840, 22, 2
         a = model.resolve(ip=ip)
         a.touch(now_iso())
         a.attrs["tcp_open_ports"] = sorted(set(a.attrs.get("tcp_open_ports", [])) | set(open_ports))
-        return {"ip": ip, "open": open_ports}
+        for p, b in banners.items():
+            if b:
+                a.attrs[f"banner_{p}"] = b
+                if p == 23:
+                    a.roles.add("legacy_management")    # telnet on a PLC = finding-grade
+        return {"ip": ip, "open": open_ports, "banners": banners}
     return None
 
 
@@ -2123,9 +2486,12 @@ def main(argv=None):
     p.add_argument("--yes", action="store_true", help="acknowledge 'confirm' decisions")
 
     p = sub.add_parser("diff", help="compare two saved states (new/departed devices, new edges)")
-    p.add_argument("old")
-    p.add_argument("new")
-    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument("old", help="older state json")
+    p.add_argument("new", help="newer state json")
+    p.add_argument("--json", action="store_true", help="machine-readable diff")
+    p = sub.add_parser("stale", help="list assets not seen on the wire for N days")
+    p.add_argument("--db", default=str(ROOT / "data" / "zerot_state.json"))
+    p.add_argument("--days", type=float, default=7.0, help="idle threshold in days")
 
     p = sub.add_parser("export", help="export graph/assets from a saved state")
     p.add_argument("--db", default=str(ROOT / "data" / "zerot_state.json"))
@@ -2317,6 +2683,33 @@ def main(argv=None):
             print(f"[+] wrote {args.output}")
         else:
             print(out)
+
+    elif args.cmd == "stale":
+        model = Model.load(args.db)
+        days = args.days
+        now = datetime.now(timezone.utc)
+        rows = []
+        for a in sorted(model.assets.values(), key=lambda x: x.id):
+            if not a.last_seen:
+                continue
+            try:
+                seen = datetime.fromisoformat(a.last_seen)
+            except ValueError:
+                continue
+            if seen.tzinfo is None:
+                seen = seen.replace(tzinfo=timezone.utc)
+            idle = (now - seen).total_seconds() / 86400
+            if idle >= days:
+                rows.append((idle, a))
+        if not rows:
+            print(f"[+] no assets silent for >= {days} days")
+            return 0
+        print(f"[!] {len(rows)} asset(s) silent for >= {days} days (of {len(model.assets)}):")
+        for idle, a in sorted(rows, key=lambda r: -r[0]):
+            z = a.zone(model.scope)
+            roles = ",".join(sorted(a.roles)[:3]) or "-"
+            print(f"  {idle:7.1f}d  {a.label:<34} {z:<14} {roles}")
+        print("[i] staleness = last_seen on the wire; verify before declaring decommissioned")
 
     elif args.cmd == "serve":
         db = Path(args.db)

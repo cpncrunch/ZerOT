@@ -19,9 +19,12 @@ enterprise→PLC traversal.*
 
 | Layer | Source | Output |
 |---|---|---|
-| Devices | Ethernet/ARP/DHCP/LLDP/NBNS/PN-DCP | assets with MAC↔IP, vendor (IEEE OUI), hostnames |
+| Devices | Ethernet/ARP/DHCP/LLDP/**CDP**/NBNS/PN-DCP/**IPv6 NDP** | assets with MAC↔IP, vendor (IEEE OUI), hostnames |
 | Conversations | Modbus, S7comm, EtherNet/IP, DNP3, IEC 60870-5-104, OPC UA, BACnet, PROFINET RT, MQTT | directed master→slave / client→broker edges, write counts, exception counts |
 | Products | CIP Identity (listIdentity), PN-DCP, DHCP | product names ("1756-L83E"), station names |
+| **Identity enrichment** | **SNMP v1/v2c** (passive: community strings, sysDescr/sysName/sysLocation/sysContact) | switch/RTU/gateway identity; default communities are themselves a finding-grade fact |
+| **Encrypted links** | **TLS ClientHello SNI** (any TCP port) | HTTPS HMI / TLS-MQTT hostnames — metadata only, no decryption |
+| **Segmentation** | **802.1Q VLAN tags** (SPAN/mirror captures) | LLDP/PROFINET/CDP still parsed through the tag; VLAN id stored per asset |
 | **Smart building / IoT** | mDNS (HomeKit/ESPHome-style PTR/SRV/TXT/A), SSDP (UPnP M-SEARCH/NOTIFY), MQTT (client-ids, topics), KNXnet/IP (search, gateway names), BACnet | thermostats, hubs, sensors as `iot_device` assets with model/platform attrs; `IoT device on OT network` findings |
 | **Hidden layers** | Modbus unit IDs (>1 unit = gateway; each unit = child PLC) | virtual child assets + bridge edges |
 | **Hidden layers** | DNP3 link addresses (>1 dst = data concentrator; each link = child RTU) | virtual child assets + bridge edges |
@@ -29,6 +32,7 @@ enterprise→PLC traversal.*
 | Purdue zones | scope file CIDRs | zone + Purdue level per asset |
 | Risk | consumer-vendor device in OT zone, rogue OT master, enterprise→control session, write activity | findings (high/medium/info) |
 | Attack paths | BFS from enterprise masters to PLC/RTUs across all edges incl. bridges | multi-hop enterprise→PLC paths |
+| **Drift** | `last_seen` per asset | `zerot stale --days N` lists assets silent for N days |
 
 ## Install
 
@@ -118,6 +122,16 @@ Reports new devices (with vendor/zone/roles), departed devices, new
 conversations, and new findings — a new device showing up on an OT network is
 itself a reportable observation.
 
+## Staleness (silent assets)
+
+```
+python3 zerot.py stale --db state.json --days 7
+```
+
+Lists assets whose last on-the-wire activity is older than the threshold —
+candidates for decommissioned gear, dead sensors, or inventory drift. Frame it
+as an observation: silent ≠ gone (a PLC polled once a day is silent 23h).
+
 ## Layer crawling
 
 ```
@@ -177,9 +191,11 @@ blocked at execution time.
 python3 -m pytest tests/ -q
 ```
 
-49 tests over the synthetic known-answer fixture: vendors, roles, edges,
-gateway/concentrator virtual children, router-guard, TTL hop inference, attack
-paths, smart-building/IoT devices (mDNS/SSDP/MQTT/KNX), IoT-on-OT findings,
+57 tests over the synthetic known-answer fixture: vendors, roles, edges,
+gateway/concentrator virtual children, router-guard (scope-derived boundaries
++ /23 merge), TTL hop inference, attack paths, smart-building/IoT devices
+(mDNS/SSDP/MQTT/KNX), IoT-on-OT findings, CDP/VLAN-through-tag/SNMP
+community+system-group/TLS SNI/NDP identity, banner grab, staleness CLI,
 active gating (dry-run, unknown-technique block, confirm-requires-yes),
 exports, save/load roundtrip, CLI smoke.
 

@@ -52,6 +52,7 @@ import sys
 from pathlib import Path
 
 from scapy.all import Ether, IP, ARP, UDP, TCP, Raw, wrpcap, conf
+from scapy.all import Dot1Q, IPv6, ICMPv6ND_NS, ICMPv6ND_NA, ICMPv6NDOptSrcLLAddr
 
 conf.verb = 0
 
@@ -432,6 +433,114 @@ def arp_whohas(target_ip, src_key):
     return Ether(src=MAC[src_key], dst="ff:ff:ff:ff:ff:ff", type=0x0806) / ARP(
         op=1, hwsrc=MAC[src_key], psrc=IPS[src_key], hwdst="00:00:00:00:00:00", pdst=target_ip)
 
+# --- CDP --------------------------------------------------------------------- #
+def cdp_tlv(t, val):
+    return struct.pack(">HH", t, len(val)) + val
+
+def cdp_frame():
+    """Cisco switch announcing itself. CDP ethertype 0x2000, dst 01:00:0c:cc:cc:cc.
+    Header: version(1) ttl(1) checksum(2); checksum is the ones-complement sum
+    over the whole CDP packet (header + TLVs), same algorithm as the IOS CLI shows."""
+    body = b"\x02\x5a\x00\x00"  # version 2, ttl 90, checksum placeholder
+    body += cdp_tlv(0x01, b"SW-ENT-01.cisco.local")
+    body += cdp_tlv(0x02, b"GigabitEthernet0/2")
+    body += cdp_tlv(0x03, b"IOS 15.2(4)M7, C2960 Software (C2960-LANLITEK9-M)")
+    body += cdp_tlv(0x0A, struct.pack(">H", 90))                    # native VLAN 90
+    body += cdp_tlv(0x11, struct.pack(">I", 0x00000008))            # caps: switch (0x08)
+    # addresses TLV: count + (plen=1, proto=0xcc, addrlen=4, ip)
+    addr = struct.pack(">I", 1) + bytes([1]) + b"\xcc" + struct.pack(">H", 4) + bytes([10, 20, 9, 9])
+    body += cdp_tlv(0x16, addr)
+    s = sum(body) & 0xFFFF
+    ck = (~s) & 0xFFFF
+    body = body[:2] + struct.pack(">H", ck) + body[4:]
+    return Ether(src=MAC["cisco_sw"], dst="01:00:0c:cc:cc:cc", type=0x2000) / Raw(load=body)
+
+# --- SNMP -------------------------------------------------------------------- #
+def ber_len(n):
+    if n < 0x80:
+        return bytes([n])
+    out = b""
+    while n:
+        out = bytes([n & 0xFF]) + out
+        n >>= 8
+    return bytes([0x80 | len(out)]) + out
+
+def ber_tlv(tag, val):
+    return bytes([tag]) + ber_len(len(val)) + val
+
+def oid_encode(dotted):
+    parts = [int(x) for x in dotted.split(".")]
+    out = bytearray([parts[0] * 40 + parts[1]])
+    for p in parts[2:]:
+        stack = [p & 0x7F]
+        p >>= 7
+        while p:
+            stack.append((p & 0x7F) | 0x80)
+            p >>= 7
+        out += bytes(reversed(stack))
+    return bytes(out)
+
+def snmp_get(community, oids, rid=1):
+    vbs = b"".join(ber_tlv(0x30, ber_tlv(0x06, oid_encode(o)) + ber_tlv(0x05, b"")) for o in oids)
+    pdu = ber_tlv(0xA0, ber_tlv(0x02, bytes([rid])) + ber_tlv(0x02, b"\x00") + ber_tlv(0x02, b"\x00") + ber_tlv(0x30, vbs))
+    return ber_tlv(0x30, ber_tlv(0x02, b"\x00") + ber_tlv(0x04, community.encode()) + pdu)
+
+def snmp_response(community, sysdescr, sysname, sysloc, rid=1):
+    def vb(oid, tag, val):
+        return ber_tlv(0x30, ber_tlv(0x06, oid_encode(oid)) + ber_tlv(tag, val))
+    vbs = (vb("1.3.6.1.2.1.1.1.0", 0x04, sysdescr.encode()) +
+           vb("1.3.6.1.2.1.1.2.0", 0x06, oid_encode("1.3.6.1.4.1.9.1.696")) +   # sysObjectID
+           vb("1.3.6.1.2.1.1.3.0", 0x43, b"\x01\x18\x00\x00") +                   # TimeTicks
+           vb("1.3.6.1.2.1.1.4.0", 0x04, b"noc@plant.example") +                   # sysContact
+           vb("1.3.6.1.2.1.1.5.0", 0x04, sysname.encode()) +                       # sysName
+           vb("1.3.6.1.2.1.1.6.0", 0x04, sysloc.encode()))                         # sysLocation
+    pdu = ber_tlv(0xA2, ber_tlv(0x02, bytes([rid])) + ber_tlv(0x02, b"\x00") + ber_tlv(0x02, b"\x00") + ber_tlv(0x30, vbs))
+    return ber_tlv(0x30, ber_tlv(0x02, b"\x00") + ber_tlv(0x04, community.encode()) + pdu)
+
+# --- TLS ClientHello with SNI ------------------------------------------------ #
+def tls_clienthello_sni(sni, host_key="ews", dst_ip=None, dst_port=443):
+    host = dst_ip or "10.20.9.10"
+    name = sni.encode()
+    # server_name ext: list_len(2) name_type(1)=0 name_len(2) name
+    edata = struct.pack(">HBH", 1 + 2 + len(name), 0, len(name)) + name
+    ext = struct.pack(">HH", 0, len(edata)) + edata
+    ch = struct.pack(">H", 0x0303) + b"\xaa" * 32 + b"\x00"      # ver, random, sid
+    ch += struct.pack(">H", 2) + b"\x2f\x00"                     # 1 cipher-suite
+    ch += b"\x01\x00"                                            # comp methods: null
+    ch += struct.pack(">H", len(ext)) + ext
+    hs = b"\x01" + len(ch).to_bytes(3, "big") + ch               # handshake: ClientHello (3-byte len)
+    rec = b"\x16" + struct.pack(">H", 0x0301) + struct.pack(">H", len(hs)) + hs
+    return eth_ip_tcp(MAC[host_key], "aa:bb:cc:00:00:09", IPS[host_key], host,
+                      49200, dst_port, Raw(load=rec))
+
+# --- VLAN-tagged frames ------------------------------------------------------- #
+def vlan_tag(pkt, vid):
+    """Single-tag a frame the way a SPAN port delivers it. Dot1Q.type must be
+    set explicitly — scapy leaves it 0 when the payload is Raw."""
+    e = pkt[Ether]
+    return Ether(src=e.src, dst=e.dst, type=0x8100) / Dot1Q(vlan=vid, type=e.type) / e.payload
+
+# --- IPv6 NDP ----------------------------------------------------------------- #
+def ndp_frames():
+    """NA (multicast to all-nodes) + NS (solicited-node) from the dual-stack HMI."""
+    mac = MAC["hmi"]
+    eui = bytearray(bytes.fromhex(mac.replace(":", "")))
+    eui[0] ^= 0x02
+    ll = bytes(eui[:3]) + b"\xff\xfe" + bytes(eui[3:])
+    ll6 = "fe80::" + ":".join(ll[i:i + 2].hex() for i in range(0, 8, 2))
+    na = (Ether(src=mac, dst="33:33:00:00:00:01", type=0x86DD) /
+          IPv6(src=ll6, dst="ff02::1") /
+          ICMPv6ND_NA(tgt=ll6, R=0, S=1, O=1) /
+          ICMPv6NDOptSrcLLAddr(lladdr=mac))
+    low24 = ll[-3:]
+    snode = "ff02::1:ff%02x:%02x%02x" % (low24[0], low24[1], low24[2])
+    mcast_mac = "33:33:ff:%02x:%02x:%02x" % (low24[0], low24[1], low24[2])
+    ns = (Ether(src=mac, dst=mcast_mac, type=0x86DD) /
+          IPv6(src=ll6, dst=snode) /
+          ICMPv6ND_NS(tgt=ll6) /
+          ICMPv6NDOptSrcLLAddr(lladdr=mac))
+    return na, ns
+
 # ============================================================================
 IPS = {
     "plc_s7": "10.20.5.11", "plc_mb": "10.20.5.12", "plc_ab": "10.20.5.13",
@@ -455,6 +564,10 @@ MAC["nest_hub"] = "60:70:6c:aa:05:62"    # Google, Inc. (smart display hub, mDNS
 IPS["nest_hub"] = "10.20.5.62"
 MAC["knx_gw"] = "64:16:66:aa:05:63"      # Nest Labs Inc. OUI borrowed for KNX gw demo
 IPS["knx_gw"] = "10.20.5.63"
+MAC["cisco_sw"] = "00:1b:0d:aa:09:09"    # Cisco Systems, Inc OUI
+IPS["cisco_sw"] = "10.20.9.9"
+MAC["hmi"] = "00:0c:29:aa:09:40"         # VMware, Inc. (engineering HMI, dual-stack)
+IPS["hmi"] = "10.20.9.40"
 
 def build():
     out = []
@@ -515,6 +628,21 @@ def build():
     # discovery / infrastructure
     out.append(lldp_frame("SW-CTRL-01", caps_word=0x0004))
     out.append(lldp_router_frame())
+    # the same MOXA switch LLDP, but VLAN-tagged the way a SPAN port sees it
+    out.append(vlan_tag(lldp_frame("SW-CTRL-01", caps_word=0x0004), 20))
+    out.append(cdp_frame())
+    # SNMP: NMS polls the switch, response carries sysDescr/sysName/sysLocation
+    out.append(eth_ip_udp(MAC["ews"], MAC["sw"], IPS["ews"], IPS["sw"], 49154, 161,
+                          snmp_get("public", ["1.3.6.1.2.1.1.1.0", "1.3.6.1.2.1.1.5.0"])))
+    out.append(eth_ip_udp(MAC["sw"], MAC["ews"], IPS["sw"], IPS["ews"], 161, 49154,
+                          snmp_response("public", "Cisco IOS Software, C2960 Software (C2960-LANLITEK9-M), Version 15.2(4)M7",
+                                        "SW-CTRL-01", "Plant A - Substation 2 - Cabinet 4")))
+    # HTTPS HMI: SNI leaks the hostname despite TLS
+    out.append(tls_clienthello_sni("hmi.plant.example", host_key="hmi", dst_ip="10.20.9.10"))
+    # IPv6 NDP from the dual-stack HMI
+    na, ns = ndp_frames()
+    out.append(na)
+    out.append(ns)
     out.append(pn_dcp_identify_response())
     out.append(pn_rt_data("scada", "plc_s7"))
     out.append(pn_rt_data("scada", "plc_ab"))

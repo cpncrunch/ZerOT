@@ -745,3 +745,143 @@ def test_cve_db_is_verified_source():
             assert c["url"].startswith("https://nvd.nist.gov/vuln/detail/"), c
             n += 1
     assert n >= 50, f"db too thin: {n}"
+
+
+# ---- blind-spot round: VLAN, CDP, SNMP, SNI, NDP, banners, guard, stale ---- #
+
+
+def test_vlan_tagged_lldp_is_parsed_and_records_vlan(model):
+    """A SPAN-port capture carries 802.1Q tags; LLDP behind the tag must still
+    resolve (ethertype 0x8100 would otherwise blind the dissector) and the
+    VLAN id becomes an asset attribute."""
+    sw = by_ip(model)["10.20.5.2"]
+    assert "switch" in sw.roles                      # LLDP parsed through the tag
+    assert sw.attrs.get("vlan") == 20                # tag recorded as identity
+
+
+def test_cdp_names_cisco_device(model):
+    cdp = [a for a in model.assets.values() if "cdp" in a.protocols]
+    assert len(cdp) == 1
+    a = cdp[0]
+    assert a.attrs.get("cdp_devid") == "SW-ENT-01.cisco.local"
+    assert "SW-ENT-01.cisco.local" in a.hostnames
+    assert a.attrs.get("vlan") == 90                 # native-VLAN TLV
+    assert "switch" in a.roles                       # caps bit
+    assert "10.20.9.9" in a.ips                      # addresses TLV -> mgmt IP
+    assert a.vendor == "Cisco Systems, Inc"          # OUI (00:1b:0d)
+
+
+def test_snmp_community_and_system_group(model):
+    """v1/v2c community strings ride in the clear; responses carry the system
+    group — sysName/sysDescr/sysLocation/sysContact."""
+    sw = by_ip(model)["10.20.5.2"]
+    assert sw.attrs.get("snmp_community") == "public"
+    assert sw.attrs.get("snmp_sysName") == "SW-CTRL-01"
+    assert "SW-CTRL-01" in sw.hostnames
+    assert "C2960" in sw.attrs.get("snmp_sysDescr", "")
+    assert sw.attrs.get("snmp_sysLocation") == "Plant A - Substation 2 - Cabinet 4"
+    assert sw.attrs.get("snmp_sysContact") == "noc@plant.example"
+    assert "snmp_agent" in sw.roles
+    ews = by_ip(model)["10.20.9.30"]
+    assert "snmp_manager" in ews.roles               # the poller
+    assert ews.attrs.get("snmp_community") == "public"
+
+
+def test_tls_clienthello_sni(model):
+    """SNI leaks the HTTPS HMI hostname through TLS; the DESTINATION is the
+    named service, the source is the client we tag."""
+    hmi = by_ip(model)["10.20.9.40"]
+    assert hmi.attrs.get("tls_sni") == "hmi.plant.example"
+    assert "tls" in hmi.protocols
+
+
+def test_ndp_ipv6_identity(model):
+    """Dual-stack HMI: NDP NA/NS bind its MAC to a link-local address. The
+    SLLA option inside NDP is authoritative even on multicast frames."""
+    hmi = by_ip(model)["10.20.9.40"]
+    assert "ndp" in hmi.protocols
+    assert any(ip6.startswith("fe80::") for ip6 in hmi.attrs.get("ip6s", []))
+    assert hmi.id == "00:0C:29:AA:09:40"             # MAC-keyed via SLLA, not ip-keyed
+
+
+def test_router_guard_boundary_from_scope(tmp_path):
+    """Guard must use the scope's segmentation lines, not a hardcoded /24:
+    same /24 but across a scope boundary => last-hop router, not identity
+    merge; same scope zone (here: a /23) => merge is allowed."""
+    scope = Scope({"name": "t", "zones": {"L1": ["10.20.5.0/24"], "L2_L3": ["10.20.7.0/23"]},
+                   "excluded": [], "active": {"enabled": False, "techniques": {}}})
+    m = Model(scope)
+    m.bind("10.20.7.20", "AA:BB:CC:00:07:20")
+    m.bind("10.20.7.21", "AA:BB:CC:00:07:20")        # same /23 zone -> merge
+    a = m.resolve(ip="10.20.7.20")
+    assert "10.20.7.21" in a.ips and a.mac == "AA:BB:CC:00:07:20"
+    m2 = Model(scope)
+    m2.bind("10.20.5.11", "AA:BB:CC:00:05:11")
+    r = m2.resolve(ip="10.20.7.99", mac="AA:BB:CC:00:05:11")   # cross-zone via same MAC
+    assert r.id != "AA:BB:CC:00:05:11"               # kept separate
+    assert r.attrs.get("last_hop_router") == "AA:BB:CC:00:05:11"
+
+
+def test_tcp_probe_captures_banner(tmp_path):
+    """Open port alone is weak evidence; the first bytes off 21/22/23/80 name
+    the service. Fixture: a local listener that greets like a PLC telnetd."""
+    import socket as s
+    srv = s.socket(s.AF_INET, s.SOCK_STREAM)
+    srv.setsockopt(s.SOL_SOCKET, s.SO_REUSEADDR, 1)
+    # banner grab is intentionally limited to greeting-services (21/22/23/80);
+    # bind the real port 23 — tests run as root on this box
+    srv.bind(("127.0.0.1", 23))
+    srv.listen(1)
+    port = 23
+    import threading
+    stop = threading.Event()
+    def greet():
+        srv.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                c, _ = srv.accept()
+                c.sendall(b"\r\n\nSIMATIC S7-300 telnet server\r\n\n")
+                c.close()
+            except OSError:
+                continue
+    threading.Thread(target=greet, daemon=True).start()
+    m = Model()
+    try:
+        res = ds._probe_tcp("127.0.0.1", m, ports=(port,))
+    finally:
+        stop.set()
+    assert res and port in res["open"]
+    assert "SIMATIC" in res["banners"].get(port, "")
+    a = m.resolve(ip="127.0.0.1")
+    assert "SIMATIC" in a.attrs.get(f"banner_{port}", "")
+    assert "legacy_management" in a.roles
+    srv.close()
+
+
+def test_stale_cli_reports_silent_assets(tmp_path, model):
+    """stale = last_seen-based drift report; backdating the fixture model must
+    list its assets as silent."""
+    import io, contextlib
+    from datetime import datetime, timedelta
+    db = tmp_path / "stale.json"
+    for a in model.assets.values():
+        if a.last_seen:
+            a.last_seen = (datetime.fromisoformat(a.last_seen) - timedelta(days=30)).isoformat()
+    model.save(db)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = ds.main(["stale", "--db", str(db), "--days", "7"])
+    assert rc == 0
+    out = buf.getvalue()
+    assert "silent for >= 7.0 days" in out
+    assert "CONTRACTOR-LT" in out
+    # and a fresh model reports nothing
+    m2 = Model(Scope(SCOPE))
+    m2.ingest_pcap(FIXTURE)
+    db2 = tmp_path / "fresh.json"
+    m2.save(db2)
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        rc2 = ds.main(["stale", "--db", str(db2), "--days", "7"])
+    assert rc2 == 0
+    assert "no assets silent" in buf2.getvalue()
