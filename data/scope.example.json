@@ -1,5 +1,5 @@
 {
-  "name": "Downstream demo plant",
+  "name": "ZerOT demo plant",
   "zones": {"L1": ["10.20.5.0/24"], "L2_L3": ["10.20.7.0/24"], "Enterprise": ["10.20.9.0/24"]},
   "excluded": [],
   "active": {
